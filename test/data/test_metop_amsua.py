@@ -25,6 +25,7 @@ import pytest
 from earth2studio.data import MetOpAMSUA
 from earth2studio.data.metop_amsua import (
     _GRH_SIZE,
+    _GSI_SCAN_ANGLES,
     _MDR_RECORD_CLASS,
     _MDR_RECORD_SUBCLASS,
     _MDR_SIZE,
@@ -271,6 +272,12 @@ def test_parse_native_amsua():
     assert set(df["satellite"].unique()) == {"metop-b"}
     assert (df["variable"] == "amsua").all()
     assert (df["class"] == "rad").all()
+    first_channel = df.iloc[:_NUM_FOVS]
+    np.testing.assert_allclose(
+        first_channel["scan_angle"].to_numpy(), _GSI_SCAN_ANGLES
+    )
+    assert (first_channel["satellite_za"].iloc[:15] < 0).all()
+    assert (first_channel["satellite_za"].iloc[15:] > 0).all()
     assert "quality" in df.columns
     assert (df["quality"] == 0).all()  # default quality_val=0
 

@@ -81,6 +81,16 @@ _MDR_SIZE = 3464
 # Using 200 ms as representative dwell for per-FOV time interpolation.
 _SCAN_PERIOD_S = 8.0 / 3.0  # 2.667 s per scan revolution
 _FOV_DWELL_S = 0.2  # ~200 ms per FOV step
+# GSI/UFS stores Scan_Angle as the scan-position look angle from global_scaninfo,
+# separate from signed satellite zenith angle.
+_GSI_SCAN_START_DEG = -48.333
+_GSI_SCAN_STEP_DEG = 3.333
+_GSI_SCAN_ANGLES = (
+    _GSI_SCAN_START_DEG + np.arange(_NUM_FOVS, dtype=np.float32) * _GSI_SCAN_STEP_DEG
+).astype(np.float32)
+_GSI_FOV_SIGN = np.where(np.arange(_NUM_FOVS) < (_NUM_FOVS // 2), -1.0, 1.0).astype(
+    np.float32
+)
 
 # Metop-B AMSU-A central wavenumbers (cm⁻¹) per channel 1–15
 # From ATOVS L1B Product Guide, Appendix A
@@ -252,6 +262,7 @@ def _parse_native_amsua(data: bytes) -> pd.DataFrame:
     sat_za = np.empty(n_obs, dtype=np.float32)
     solar_azi = np.empty(n_obs, dtype=np.float32)
     sat_azi = np.empty(n_obs, dtype=np.float32)
+    scan_angle = np.empty(n_obs, dtype=np.float32)
     # Radiances: (n_scans*30, 15) → brightness temps per channel
     radiances = np.empty((n_obs, _NUM_CHANNELS), dtype=np.float64)
     scan_times = np.empty(n_obs, dtype="datetime64[ns]")
@@ -276,6 +287,7 @@ def _parse_native_amsua(data: bytes) -> pd.DataFrame:
         scan_time = sensing_start + timedelta(seconds=scan_idx * dt_per_scan)
         scan_time_ns = np.datetime64(scan_time, "ns")
         scan_times[base : base + _NUM_FOVS] = scan_time_ns + fov_offsets_ns
+        scan_angle[base : base + _NUM_FOVS] = _GSI_SCAN_ANGLES
 
         # SCENE_RADIANCE: integer4, 15×30, SF=1e7 at offset 22
         # Interleaved: (ch1_fov1, ch2_fov1, ..., ch15_fov1, ch1_fov2, ...)
@@ -293,7 +305,7 @@ def _parse_native_amsua(data: bytes) -> pd.DataFrame:
         raw_ang = struct.unpack_from(f">{4 * _NUM_FOVS}h", data, ang_off)
         ang = np.array(raw_ang, dtype=np.float32) / 100.0
         solar_za[base : base + _NUM_FOVS] = ang[0::4]
-        sat_za[base : base + _NUM_FOVS] = ang[1::4]
+        sat_za[base : base + _NUM_FOVS] = np.abs(ang[1::4]) * _GSI_FOV_SIGN
         solar_azi[base : base + _NUM_FOVS] = ang[2::4]
         sat_azi[base : base + _NUM_FOVS] = ang[3::4]
 
@@ -348,7 +360,7 @@ def _parse_native_amsua(data: bytes) -> pd.DataFrame:
     all_obs = np.empty(total_rows, dtype=np.float32)
     all_sensor_idx = np.empty(total_rows, dtype=np.uint16)
     all_wavenumber = np.empty(total_rows, dtype=np.float64)
-    all_scan_angle = np.tile(sat_za, n_valid_channels)  # scan angle ≈ sat zenith
+    all_scan_angle = np.tile(scan_angle, n_valid_channels)
     all_quality = np.tile(quality, n_valid_channels)
 
     for i, ch_idx in enumerate(valid_channels):

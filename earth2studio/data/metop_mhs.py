@@ -73,15 +73,19 @@ _NUM_CHANNELS = 5
 _NUM_FOVS = 90
 _MDR_SIZE = 4316
 
-# MHS scan timing
-# MHS shares the same antenna assembly as AMSU-A on MetOp:
-# 3 antenna revolutions per 8 seconds → scan period = 8/3 s ≈ 2.667 s
-# 90 FOVs per scan → dwell per FOV ≈ 2.667/90 ≈ 29.6 ms
-#
-# Source: NOAA KLM User's Guide, Section 3.9 "MHS Instrument Description"
-#   https://www.star.nesdis.noaa.gov/mirs/documents/0.0_NOAA_KLM_Users_Guide.pdf
-_SCAN_PERIOD_S = 8.0 / 3.0  # 2.667 s per scan revolution
-_FOV_DWELL_S = _SCAN_PERIOD_S / _NUM_FOVS  # ~29.6 ms per FOV step
+# MHS MDRs carry one UTC_SL_TIME timestamp per scanline. NCEP BUFR/GSI uses
+# that scanline timestamp for every FOV; do not synthesize per-FOV offsets when
+# matching GSI/UFS Obs_Time.
+# GSI/UFS stores Scan_Angle as the scan-position look angle from global_scaninfo,
+# separate from signed satellite zenith angle.
+_GSI_SCAN_START_DEG = -49.444
+_GSI_SCAN_STEP_DEG = 1.111
+_GSI_SCAN_ANGLES = (
+    _GSI_SCAN_START_DEG + np.arange(_NUM_FOVS, dtype=np.float32) * _GSI_SCAN_STEP_DEG
+).astype(np.float32)
+_GSI_FOV_SIGN = np.where(np.arange(_NUM_FOVS) < (_NUM_FOVS // 2), -1.0, 1.0).astype(
+    np.float32
+)
 
 # MHS central wavenumbers (cm⁻¹) per channel 1–5
 # Frequency → wavenumber: ν(cm⁻¹) = f(GHz) / c(cm/s) × 1e9
@@ -307,6 +311,7 @@ def _parse_native_mhs(data: bytes) -> pd.DataFrame:
     sat_za = np.empty(n_obs, dtype=np.float32)
     solar_azi = np.empty(n_obs, dtype=np.float32)
     sat_azi = np.empty(n_obs, dtype=np.float32)
+    scan_angle = np.empty(n_obs, dtype=np.float32)
     # Radiances: (n_scans*90, 5) → brightness temps per channel
     radiances = np.empty((n_obs, _NUM_CHANNELS), dtype=np.float64)
     scan_times = np.empty(n_obs, dtype="datetime64[ns]")
@@ -314,11 +319,6 @@ def _parse_native_mhs(data: bytes) -> pd.DataFrame:
 
     # CDS epoch for per-scanline UTC time
     _CDS_EPOCH = datetime(2000, 1, 1)
-
-    # Pre-compute per-FOV time offsets within a scan
-    fov_offsets_ns = np.array(
-        [np.timedelta64(int(i * _FOV_DWELL_S * 1e9), "ns") for i in range(_NUM_FOVS)]
-    )
 
     for scan_idx, mdr_off in enumerate(mdr_offsets):
         base = scan_idx * _NUM_FOVS
@@ -329,7 +329,10 @@ def _parse_native_mhs(data: bytes) -> pd.DataFrame:
         cds_ms = struct.unpack_from(">I", data, mdr_off + 24)[0]
         scan_time = _CDS_EPOCH + timedelta(days=cds_day, milliseconds=cds_ms)
         scan_time_ns = np.datetime64(scan_time, "ns")
-        scan_times[base : base + _NUM_FOVS] = scan_time_ns + fov_offsets_ns
+        # Match the NCEP/GSI convention: the BUFR SECO value is scanline time,
+        # shared by all FOVs in the scanline.
+        scan_times[base : base + _NUM_FOVS] = scan_time_ns
+        scan_angle[base : base + _NUM_FOVS] = _GSI_SCAN_ANGLES
 
         # SCENE_RADIANCE: integer4, [5,90] FOV-major, SF=1e7
         # Memory layout: (ch1_fov1, ch2_fov1, ..., ch5_fov1, ch1_fov2, ...)
@@ -347,7 +350,7 @@ def _parse_native_mhs(data: bytes) -> pd.DataFrame:
         raw_ang = struct.unpack_from(f">{4 * _NUM_FOVS}h", data, ang_off)
         ang = np.array(raw_ang, dtype=np.float32) / 100.0
         solar_za[base : base + _NUM_FOVS] = ang[0::4]
-        sat_za[base : base + _NUM_FOVS] = ang[1::4]
+        sat_za[base : base + _NUM_FOVS] = np.abs(ang[1::4]) * _GSI_FOV_SIGN
         solar_azi[base : base + _NUM_FOVS] = ang[2::4]
         sat_azi[base : base + _NUM_FOVS] = ang[3::4]
 
@@ -407,7 +410,7 @@ def _parse_native_mhs(data: bytes) -> pd.DataFrame:
     all_obs = np.empty(total_rows, dtype=np.float32)
     all_sensor_idx = np.empty(total_rows, dtype=np.uint16)
     all_wavenumber = np.empty(total_rows, dtype=np.float64)
-    all_scan_angle = np.tile(sat_za, n_valid_channels)  # scan angle ≈ sat zenith
+    all_scan_angle = np.tile(scan_angle, n_valid_channels)
     all_quality = np.tile(quality, n_valid_channels)
 
     for i, ch_idx in enumerate(valid_channels):

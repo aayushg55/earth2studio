@@ -26,6 +26,7 @@ from earth2studio.data import MetOpMHS
 from earth2studio.data.metop_mhs import (
     _ANGULAR_RELATION_OFFSET,
     _EARTH_LOCATION_OFFSET,
+    _GSI_SCAN_ANGLES,
     _GRH_SIZE,
     _MDR_RECORD_CLASS,
     _MDR_RECORD_SUBCLASS,
@@ -292,6 +293,13 @@ def test_parse_native_mhs():
     assert set(df["satellite"].unique()) == {"metop-b"}
     assert (df["variable"] == "mhs").all()
     assert (df["class"] == "rad").all()
+    first_channel = df.iloc[:_NUM_FOVS]
+    assert first_channel["time"].nunique() == 1
+    np.testing.assert_allclose(
+        first_channel["scan_angle"].to_numpy(), _GSI_SCAN_ANGLES
+    )
+    assert (first_channel["satellite_za"].iloc[:45] < 0).all()
+    assert (first_channel["satellite_za"].iloc[45:] > 0).all()
     assert "quality" in df.columns
     assert (df["quality"] == 0).all()  # default quality_val=0
 
