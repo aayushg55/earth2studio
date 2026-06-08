@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 
 from earth2studio.data import JPSS_ATMS
+from earth2studio.lexicon import JPSSATMSLexicon
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,8 @@ def _make_mock_bufr_decode(n_fov=4, n_channels=22):
     # (all ch1 values, then all ch2, ...) matching real BUFR layout.
     bt = np.random.uniform(200, 300, size=(n_fov, n_channels)).astype(np.float64)
     bt_flat_channel_major = bt.T.ravel()  # (n_channels, n_fov) then ravel
+    at = bt + 0.5
+    at_flat_channel_major = at.T.ravel()
 
     def codes_get_side_effect(msgid, key):
         mapping = {
@@ -140,6 +143,7 @@ def _make_mock_bufr_decode(n_fov=4, n_channels=22):
             "solarAzimuth": np.full(n_fov, 180.0),
             "satelliteZenithAngle": np.full(n_fov, 30.0),
             "bearingOrAzimuth": np.full(n_fov, 90.0),
+            "antennaTemperature": at_flat_channel_major,
             "brightnessTemperature": bt_flat_channel_major,
             "channelDataQualityFlags": np.zeros(n_channels, dtype=np.int64),
             # Time fields (may be scalar-length or per-subset arrays)
@@ -154,13 +158,13 @@ def _make_mock_bufr_decode(n_fov=4, n_channels=22):
             return mapping[key]
         raise KeyError(key)
 
-    return codes_get_side_effect, codes_get_array_side_effect, bt
+    return codes_get_side_effect, codes_get_array_side_effect, bt, at
 
 
 def test_jpss_atms_call_mock(tmp_path):
     """Exercise the full __call__ path without any network access."""
     n_fov, n_channels = 4, 22
-    get_se, get_array_se, bt = _make_mock_bufr_decode(n_fov, n_channels)
+    get_se, get_array_se, bt, at = _make_mock_bufr_decode(n_fov, n_channels)
 
     # Create a fake cached BUFR file (content doesn't matter, eccodes is mocked)
     fake_bufr = tmp_path / "fakefile.bufr"
@@ -184,7 +188,7 @@ def test_jpss_atms_call_mock(tmp_path):
                     datetime_max=datetime(2024, 6, 1, 12, 30),
                     satellite="n20",
                     variable="atms",
-                    bufr_key="brightnessTemperature",
+                    bufr_key="antennaTemperature",
                     modifier=lambda x: x,
                 )
             ],
@@ -217,6 +221,69 @@ def test_jpss_atms_call_mock(tmp_path):
     assert df["satellite"].iloc[0] == "n20"
     assert "quality" in df.columns
     assert (df["quality"] == 0).all()
+    assert np.isclose(
+        df.loc[df["sensor_index"] == 1, "observation"].to_numpy(),
+        at[:, 0].astype(np.float32),
+    ).all()
+
+
+def test_jpss_atms_gsi_default_field():
+    """The default ATMS variable follows GSI's TMANT read path."""
+    bufr_key, modifier = JPSSATMSLexicon["atms"]
+    assert bufr_key == "antennaTemperature"
+    assert modifier(273.15) == 273.15
+
+    bt_key, _ = JPSSATMSLexicon["atms_brightness_temperature"]
+    assert bt_key == "brightnessTemperature"
+
+
+def test_jpss_atms_fractional_seconds_no_dwell_offset(tmp_path):
+    """Decode fractional BUFR SECO directly and do not add FOV dwell timing."""
+    n_fov, n_channels = 4, 22
+    get_se, get_array_se, _bt, _at = _make_mock_bufr_decode(n_fov, n_channels)
+    fractional_seconds = np.array([0.351, 0.351, 0.351, 0.351], dtype=np.float64)
+
+    def fractional_time_arrays(msgid, key):
+        if key == "second":
+            return fractional_seconds
+        return get_array_se(msgid, key)
+
+    fake_bufr = tmp_path / "fakefile.bufr"
+    fake_bufr.write_bytes(b"\x00" * 32)
+    task = MagicMock(
+        s3_uri="s3://fake/file.bufr",
+        datetime_min=datetime(2024, 6, 1, 11, 30),
+        datetime_max=datetime(2024, 6, 1, 12, 30),
+        satellite="n20",
+        variable="atms",
+        bufr_key="antennaTemperature",
+        modifier=lambda x: x,
+    )
+
+    with patch("earth2studio.data.jpss_atms.eccodes") as mock_eccodes:
+        call_count = {"new": 0}
+
+        def new_from_file(fh):
+            if call_count["new"] == 0:
+                call_count["new"] += 1
+                return 1
+            return None
+
+        mock_eccodes.codes_bufr_new_from_file = new_from_file
+        mock_eccodes.codes_set = MagicMock()
+        mock_eccodes.codes_get = MagicMock(side_effect=get_se)
+        mock_eccodes.codes_get_array = MagicMock(side_effect=fractional_time_arrays)
+        mock_eccodes.codes_release = MagicMock()
+
+        ds = JPSS_ATMS(satellites=["n20"], cache=False, verbose=False)
+        df = ds._decode_bufr(str(fake_bufr), task)
+
+    first_channel = df[df["sensor_index"] == 1].sort_values("scan_angle")
+    decoded_times = first_channel["time"].to_numpy(dtype="datetime64[ns]")
+    expected = np.datetime64("2024-06-01T12:00:00.351000000")
+
+    assert (decoded_times == expected).all()
+    assert len(np.unique(decoded_times)) == 1
 
 
 # ---------------------------------------------------------------------------

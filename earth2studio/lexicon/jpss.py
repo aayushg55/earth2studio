@@ -307,9 +307,11 @@ class JPSSLexicon(metaclass=LexiconType):
 class JPSSATMSLexicon(metaclass=LexiconType):
     """Lexicon for JPSS ATMS (Advanced Technology Microwave Sounder) data source.
 
-    This lexicon maps the ``atms`` variable to an identity modifier for brightness
-    temperature observations in Kelvin.  Individual channels (1-22) are distinguished
-    by the ``sensor_index`` column of the returned DataFrame, following the same
+    This lexicon maps the default ``atms`` variable to ATMS antenna temperature
+    observations in Kelvin.  This follows the GSI/UFS ATMS read path, where the
+    default ``ta2tb = .false.`` configuration reads ``TMANT`` rather than
+    ``TMBR``.  Individual channels (1-22) are distinguished by the
+    ``sensor_index`` column of the returned DataFrame, following the same
     convention used by :class:`~earth2studio.data.UFSObsSat`.
 
     The ATMS instrument is a 22-channel cross-track scanning microwave radiometer
@@ -365,7 +367,11 @@ class JPSSATMSLexicon(metaclass=LexiconType):
     }
 
     VOCAB: dict[str, str] = {
-        "atms": "brightnessTemperature",
+        # GSI read_atms.f90 reads TMANT by default for ATMS.  Keep explicit
+        # aliases so users can request either physical BUFR field directly.
+        "atms": "antennaTemperature",
+        "atms_antenna_temperature": "antennaTemperature",
+        "atms_brightness_temperature": "brightnessTemperature",
     }
 
     @classmethod
@@ -381,8 +387,8 @@ class JPSSATMSLexicon(metaclass=LexiconType):
         -------
         tuple[str, Callable]
             Tuple containing:
-            - BUFR key name for brightness temperature
-            - Modifier function (identity -- brightness temperature in K)
+            - BUFR key name for the requested ATMS temperature field
+            - Modifier function (identity -- temperature in K)
         """
         if val not in cls.VOCAB:
             raise KeyError(f"Variable {val} not found in ATMS lexicon")

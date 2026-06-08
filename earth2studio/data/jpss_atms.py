@@ -84,7 +84,7 @@ _SAT_START_DATE: dict[str, datetime] = {
 }
 
 # ---------------------------------------------------------------------------
-# ATMS cross-track geometry and scan timing constants
+# ATMS cross-track geometry constants
 #
 # Source: JPSS ATMS SDR Algorithm Theoretical Basis Document (ATBD),
 #   D0001-M01-S01-001_JPSS_ATBD_ATMS-SDR_B, Version 1, 2022-04-27,
@@ -110,7 +110,9 @@ _ATMS_DEG_PER_FOV: float = _ATMS_TOTAL_SCAN_DEG / (_ATMS_NUM_FOVS - 1)  # 1.11°
 _ATMS_SCAN_PERIOD_S: float = 8.0 / 3.0  # 2.667 s
 
 # Each FOV is sampled for ~18 ms with scan speed ~61.6°/s (ATBD §3).
-# The 96 FOVs span ~1.73 s of the 2.667 s scan cycle (~65% duty cycle).
+# The 96 FOVs span ~1.73 s of the 2.667 s scan cycle (~65% duty cycle).  This
+# is instrument geometry, not a timestamp correction for NCEP/NNJA BUFR: those
+# files carry fractional SECO values, and GSI read_atms.f90 uses SECO directly.
 _ATMS_FOV_DWELL_S: float = 0.018  # 18 ms per FOV
 
 # ATMS channel center frequencies (GHz), 1-indexed → 0-indexed array.
@@ -164,29 +166,6 @@ def _fov_to_scan_angle(fov: float) -> float:
     return (fov - (_ATMS_NUM_FOVS + 1) / 2.0) * _ATMS_DEG_PER_FOV
 
 
-def _fov_to_time_offset(fov: float) -> timedelta:
-    """Compute the sub-second time offset for a given FOV within a scan line.
-
-    ATMS samples 96 FOVs sequentially at ~18 ms per step.  The BUFR time
-    fields only carry integer-second precision, so this offset is added to
-    recover approximate sub-second timing.  FOV 1 is the first sample
-    (offset = 0); FOV 96 is the last (offset ≈ 1.71 s).
-
-    Source: ATMS SDR ATBD (D0001-M01-S01-001), §3, p. 8-9.
-
-    Parameters
-    ----------
-    fov : float
-        Field-of-view number (1–96, 1-indexed).
-
-    Returns
-    -------
-    timedelta
-        Sub-second offset from the start of the scan line.
-    """
-    return timedelta(seconds=(fov - 1) * _ATMS_FOV_DWELL_S)
-
-
 @dataclass
 class _ATMSAsyncTask:
     """Metadata for a single BUFR file download task."""
@@ -203,7 +182,7 @@ class _ATMSAsyncTask:
 @check_optional_dependencies()
 class JPSS_ATMS:
     """JPSS ATMS (Advanced Technology Microwave Sounder) Level 1 BUFR
-    brightness-temperature observations served from NOAA Open Data on AWS.
+    observations served from NOAA Open Data on AWS.
 
     Each BUFR file contains a single scan line with 96 cross-track
     field-of-view (FOV) positions and 22 microwave channels.
@@ -419,7 +398,7 @@ class JPSS_ATMS:
         variable: str | list[str] | VariableArray,
         fields: str | list[str] | pa.Schema | None = None,
     ) -> pd.DataFrame:
-        """Fetch ATMS brightness-temperature observations.
+        """Fetch ATMS observations.
 
         Parameters
         ----------
@@ -665,7 +644,7 @@ class JPSS_ATMS:
         """Decode a single ATMS BUFR file into a DataFrame.
 
         Each BUFR message contains *N* subsets (FOVs).  For each subset the
-        brightness temperature array has *C* channel values, yielding
+        selected channel array has *C* channel values, yielding
         ``N * C`` rows in the output.
         """
         rows: list[dict] = []
@@ -689,22 +668,22 @@ class JPSS_ATMS:
                     sat_za = eccodes.codes_get_array(msgid, "satelliteZenithAngle")
                     sat_aza = eccodes.codes_get_array(msgid, "bearingOrAzimuth")
 
-                    # Brightness temperature array is channel-major:
+                    # ATMS channel arrays are channel-major:
                     # [ch1_fov0, ch1_fov1, ..., ch1_fovN, ch2_fov0, ...]
                     # i.e. shape (n_channels, n_fov) when reshaped, then
                     # transposed to (n_fov, n_channels) for row iteration.
-                    bt_flat = eccodes.codes_get_array(msgid, task.bufr_key)
+                    temp_flat = eccodes.codes_get_array(msgid, task.bufr_key)
                     n_channels = JPSSATMSLexicon.ATMS_NUM_CHANNELS
                     n_fov = n_subsets
 
-                    if bt_flat.size != n_fov * n_channels:
+                    if temp_flat.size != n_fov * n_channels:
                         logger.warning(
-                            f"Unexpected BT array size {bt_flat.size} in {path}, "
+                            f"Unexpected ATMS array size {temp_flat.size} in {path}, "
                             f"expected {n_fov}×{n_channels}. Skipping message."
                         )
                         continue
 
-                    bt = bt_flat.reshape(n_channels, n_fov).T
+                    temperature = temp_flat.reshape(n_channels, n_fov).T
 
                     # Per-channel quality flags (shape n_channels, one per channel)
                     try:
@@ -734,21 +713,21 @@ class JPSS_ATMS:
                     # Time fields — may be scalars or per-subset arrays
                     # depending on the BUFR producer.  Use codes_get_array
                     # for all of them and broadcast scalars to length n_fov.
-                    def _get_time_array(key: str) -> np.ndarray:
+                    def _get_time_array(key: str, dtype: type) -> np.ndarray:
                         try:
                             arr = eccodes.codes_get_array(msgid, key)
                         except Exception:
                             arr = np.zeros(n_fov)
                         if arr.size == 1:
                             arr = np.full(n_fov, arr[0])
-                        return arr.astype(int)
+                        return arr.astype(dtype)
 
-                    years = _get_time_array("year")
-                    months = _get_time_array("month")
-                    days = _get_time_array("day")
-                    hours = _get_time_array("hour")
-                    minutes = _get_time_array("minute")
-                    seconds = _get_time_array("second")
+                    years = _get_time_array("year", np.int64)
+                    months = _get_time_array("month", np.int64)
+                    days = _get_time_array("day", np.int64)
+                    hours = _get_time_array("hour", np.int64)
+                    minutes = _get_time_array("minute", np.int64)
+                    seconds = _get_time_array("second", np.float64)
 
                     # Satellite id
                     try:
@@ -766,20 +745,17 @@ class JPSS_ATMS:
                                 int(days[i]),
                                 int(hours[i]),
                                 int(minutes[i]),
-                                int(seconds[i]),
-                            )
+                            ) + timedelta(seconds=float(seconds[i]))
                         except (ValueError, OverflowError):
                             continue  # skip FOVs with invalid timestamps
 
-                        # Add sub-second offset based on FOV position in
-                        # the scan line.  BUFR only carries integer-second
-                        # timestamps; the offset recovers ~18 ms per-FOV
-                        # timing from the ATMS scan geometry (ATBD §3).
+                        # NCEP/NNJA ATMS BUFR carries fractional SECO, and
+                        # GSI read_atms.f90 uses that BUFR value directly.
+                        # Do not synthesize an extra per-FOV dwell-time offset.
                         fov_index = float(fov[i])
-                        obs_time = obs_time + _fov_to_time_offset(fov_index)
 
                         for ch in range(n_channels):
-                            raw_val = float(bt[i, ch])
+                            raw_val = float(temperature[i, ch])
                             # Skip missing / fill values
                             if raw_val > 1e6 or raw_val < 0:
                                 continue
@@ -815,7 +791,7 @@ class JPSS_ATMS:
 
         df = pd.DataFrame(rows)
         # Enforce schema dtypes
-        df["time"] = pd.to_datetime(df["time"]).astype("datetime64[ms]")
+        df["time"] = pd.to_datetime(df["time"]).astype("datetime64[ns]")
         df["lat"] = df["lat"].astype(np.float32)
         df["lon"] = df["lon"].astype(np.float32)
         df["scan_angle"] = df["scan_angle"].astype(np.float32)
