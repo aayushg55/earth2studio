@@ -47,13 +47,21 @@ from earth2studio.data.utils import (
     managed_session,
     prep_data_inputs,
 )
-from earth2studio.data.utils_bufr import BUFR_DEPENDENCY_KEY
+from earth2studio.data.utils_bufr import (
+    BUFR_DEPENDENCY_KEY,
+    BUFRDecoder,
+    PyBufrKitDecoder,
+)
 from earth2studio.data.utils_ncep import (
     NCEP_CONVENTIONAL_PUBLIC_SCHEMA,
     _empty_dataframe,
     _NCEPGpsroAdapter,
     _NCEPPrepbufrAdapter,
     map_aircraft_profile_types,
+)
+from earth2studio.data.utils_ncep_gpsro import (
+    NCEP_GPSRO_PROFILE_SCHEMA,
+    transform_gpsro_profiles,
 )
 from earth2studio.lexicon import NNJAObsConvLexicon
 from earth2studio.utils.imports import check_optional_dependencies
@@ -62,6 +70,19 @@ from earth2studio.utils.type import TimeArray, TimeTolerance, VariableArray
 
 NNJA_BUCKET = "noaa-reanalyses-pds"
 NNJA_PREFIX = "observations/reanalysis"
+
+
+def _build_nnja_gpsro_uri(cycle: datetime) -> str:
+    year_key = cycle.strftime("%Y")
+    month_key = cycle.strftime("%m")
+    date_key = cycle.strftime("%Y%m%d")
+    hour_key = f"{cycle.hour:02d}"
+    return (
+        f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/gps/gpsro/"
+        f"{year_key}/{month_key}/bufr/"
+        f"gdas.{date_key}.t{hour_key}z.gpsro.tm00.bufr_d"
+    )
+
 
 # ── Async-task dataclasses ──────────────────────────────────────────
 
@@ -90,6 +111,14 @@ class _NNJAGpsRoTask:
     var_plan: dict[str, tuple[int, Callable[[pd.DataFrame], pd.DataFrame]]] = field(
         default_factory=dict
     )
+
+
+@dataclass
+class _NNJAGPSROProfileTask:
+    """Async task for one profile-native GPSRO cycle file."""
+
+    s3_uri: str
+    datetime_file: datetime
 
 
 class _NNJAObsBase:
@@ -297,7 +326,7 @@ class _NNJAObsBase:
     def _create_tasks(self, time_list: list[datetime], variable: list[str]) -> list:
         raise NotImplementedError("Subclasses must implement _create_tasks.")
 
-    def _decode_file(self, local_path: str, task: Any) -> pd.DataFrame:
+    def _decode_file(self, local_path: str, task: Any) -> Any:
         raise NotImplementedError("Subclasses must implement _decode_file.")
 
     # ------------------------------------------------------------------
@@ -422,6 +451,201 @@ class _NNJAObsBase:
                 )
             selected.append(cls.SCHEMA.field(name))
         return pa.schema(selected)
+
+
+class _NNJAGPSROStorage(_NNJAObsBase):
+    SOURCE_ID = "earth2studio.data.NNJAGPSRO"
+    SCHEMA = NCEP_GPSRO_PROFILE_SCHEMA
+
+    def _handle_missing_file(self, path: str) -> None:
+        logger.warning(f"NNJA GPSRO file {path} not found, skipping")
+
+
+class NNJAGPSRO:
+    """Profile-native GPS radio-occultation observations from NNJA.
+
+    The data source retrieves complete NNJA GPSRO cycle files, delegates only
+    BUFR decoding to an interchangeable backend, and applies one shared
+    Earth2Studio transformation to every backend's raw Arrow output. It does
+    not apply GSI receiver, QFRO, or observation-window policy filters.
+
+    Parameters
+    ----------
+    decoder : BUFRDecoder | None, optional
+        Raw BUFR decoder. ``None`` uses :class:`PyBufrKitDecoder`. An injected
+        decoder must return raw Arrow batches that preserve BUFR field names,
+        order, and replication structure.
+    cache : bool, optional
+        Cache downloaded files in the local filesystem cache, by default True.
+    verbose : bool, optional
+        Show progress bars, by default True.
+    async_timeout : int, optional
+        Total timeout in seconds for the asynchronous fetch, by default 600.
+    async_workers : int, optional
+        Maximum number of concurrent fetch tasks, by default 24.
+    decode_workers : int, optional
+        Number of processes used by the default decoder, by default 8. An
+        injected decoder owns its own concurrency configuration.
+    retries : int, optional
+        Number of retry attempts per failed fetch, by default 3.
+
+    Warning
+    -------
+    This remote source downloads complete cycle files. Large time requests can
+    transfer substantial data; callers should process a year in bounded batches.
+    """
+
+    SOURCE_ID = "earth2studio.data.NNJAGPSRO"
+    SCHEMA = NCEP_GPSRO_PROFILE_SCHEMA
+    MIN_DATE = datetime(1979, 1, 1)
+
+    def __init__(
+        self,
+        decoder: BUFRDecoder | None = None,
+        cache: bool = True,
+        verbose: bool = True,
+        async_timeout: int = 600,
+        async_workers: int = 24,
+        decode_workers: int = 8,
+        retries: int = 3,
+    ) -> None:
+        self._storage = _NNJAGPSROStorage(
+            time_tolerance=np.timedelta64(0, "m"),
+            cache=cache,
+            verbose=verbose,
+            async_timeout=async_timeout,
+            async_workers=async_workers,
+            decode_workers=decode_workers,
+            retries=retries,
+        )
+        self._cache = cache
+        self.async_timeout = async_timeout
+        self._decoder = (
+            decoder
+            if decoder is not None
+            else PyBufrKitDecoder(decode_workers=max(1, decode_workers))
+        )
+
+    @property
+    def cache(self) -> str:
+        """Local cache directory used for NNJA cycle files."""
+        return self._storage.cache
+
+    @classmethod
+    def available(cls, time: datetime | np.datetime64) -> bool:
+        """Check whether a timestamp is a valid NNJA cycle."""
+        return _NNJAGPSROStorage.available(time)
+
+    @classmethod
+    def resolve_fields(cls, fields: str | list[str] | pa.Schema | None) -> pa.Schema:
+        """Resolve an output field selection against the profile schema."""
+        return _NNJAGPSROStorage.resolve_fields(fields)
+
+    def __call__(
+        self,
+        time: datetime | list[datetime] | TimeArray,
+        fields: str | list[str] | pa.Schema | None = None,
+    ) -> pa.Table:
+        """Fetch profile-native GPSRO observations for exact NNJA cycles.
+
+        Parameters
+        ----------
+        time : datetime | list[datetime] | TimeArray
+            Six-hourly NNJA cycle timestamps.
+        fields : str | list[str] | pa.Schema | None, optional
+            Output field subset. ``None`` returns the complete profile schema.
+
+        Returns
+        -------
+        pa.Table
+            One row per usable occultation profile.
+        """
+        try:
+            return _sync_async(self.fetch, time, fields, timeout=self.async_timeout)
+        finally:
+            if not self._cache:
+                shutil.rmtree(self.cache, ignore_errors=True)
+
+    async def fetch(
+        self,
+        time: datetime | list[datetime] | TimeArray,
+        fields: str | list[str] | pa.Schema | None = None,
+    ) -> pa.Table:
+        """Asynchronously fetch and transform exact NNJA GPSRO cycles."""
+        if self._storage.fs is None:
+            await self._storage._async_init()
+
+        time_list, _ = prep_data_inputs(time, ["gpsro"])
+        self._storage._validate_time(time_list)
+        schema = self.resolve_fields(fields)
+        pathlib.Path(self.cache).mkdir(parents=True, exist_ok=True)
+        tasks = self._create_tasks(time_list, [])
+        file_uris = list(dict.fromkeys(task.s3_uri for task in tasks))
+
+        async with managed_session(self._storage.fs):
+            coros = [
+                async_retry(
+                    self._storage._fetch_remote_file,
+                    uri,
+                    retries=self._storage._retries,
+                    backoff=1.0,
+                    task_timeout=120.0,
+                    exceptions=(OSError, IOError, TimeoutError, ConnectionError),
+                )
+                for uri in file_uris
+            ]
+            await gather_with_concurrency(
+                coros,
+                max_workers=self._storage._async_workers,
+                desc="Fetching NNJA GPSRO files",
+                verbose=(not self._storage._verbose),
+            )
+
+        table = self._compile_profiles(tasks).select(schema.names)
+        metadata = dict(table.schema.metadata or {})
+        metadata[b"source"] = self.SOURCE_ID.encode()
+        return table.replace_schema_metadata(metadata)
+
+    def _create_tasks(
+        self, time_list: list[datetime], variable: list[str]
+    ) -> list[_NNJAGPSROProfileTask]:
+        del variable
+        return [
+            _NNJAGPSROProfileTask(
+                s3_uri=_build_nnja_gpsro_uri(cycle),
+                datetime_file=cycle,
+            )
+            for cycle in dict.fromkeys(time_list)
+        ]
+
+    def _decode_file(self, local_path: str, task: _NNJAGPSROProfileTask) -> pa.Table:
+        batches = self._decoder.decode_file(local_path)
+        return transform_gpsro_profiles(batches, task.datetime_file)
+
+    def _compile_profiles(self, tasks: list[_NNJAGPSROProfileTask]) -> pa.Table:
+        tables: list[pa.Table] = []
+        for index, task in enumerate(tasks, start=1):
+            local_path = self._storage._cache_path(task.s3_uri)
+            if not pathlib.Path(local_path).is_file():
+                logger.warning(f"Cached file missing for {task.s3_uri}, skipping")
+                continue
+            short_uri = task.s3_uri.rsplit("/", 1)[-1]
+            logger.info(
+                f"[{self.SOURCE_ID}] decode {index}/{len(tasks)} start: {short_uri}"
+            )
+            start = time.perf_counter()
+            table = self._decode_file(local_path, task)
+            logger.info(
+                f"[{self.SOURCE_ID}] decode {index}/{len(tasks)} done: "
+                f"{short_uri} ({table.num_rows:,} profiles) in "
+                f"{time.perf_counter() - start:.1f}s"
+            )
+            if table.num_rows:
+                tables.append(table)
+
+        if not tables:
+            return pa.Table.from_batches([], schema=self.SCHEMA)
+        return pa.concat_tables(tables)
 
 
 @check_optional_dependencies(BUFR_DEPENDENCY_KEY)
@@ -551,9 +775,9 @@ class NNJAObsConv(_NNJAObsBase):
         # Partition variables by lexicon route prefix:
         #   "prepbufr::..." -> conv/prepbufr/ tasks (PrepBUFR decoder)
         #   "gpsro::..."    -> gps/gpsro/ tasks (GPS RO BUFR decoder)
-        prepbufr_plan: dict[str, tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]] = (
-            {}
-        )
+        prepbufr_plan: dict[
+            str, tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]
+        ] = {}
         gpsro_plan: dict[str, tuple[int, Callable[[pd.DataFrame], pd.DataFrame]]] = {}
 
         for v in variable:
@@ -625,15 +849,7 @@ class NNJAObsConv(_NNJAObsBase):
 
     def _build_gpsro_uri(self, cycle: datetime) -> str:
         """Build the NNJA S3 URI for a single gps/gpsro cycle file."""
-        year_key = cycle.strftime("%Y")
-        month_key = cycle.strftime("%m")
-        date_key = cycle.strftime("%Y%m%d")
-        hour_key = f"{cycle.hour:02d}"
-        return (
-            f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/gps/gpsro/"
-            f"{year_key}/{month_key}/bufr/"
-            f"gdas.{date_key}.t{hour_key}z.gpsro.tm00.bufr_d"
-        )
+        return _build_nnja_gpsro_uri(cycle)
 
     # Back-compat alias used by tests that targeted the v1 method name.
     def _build_uri(self, cycle: datetime) -> str:

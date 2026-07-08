@@ -46,7 +46,7 @@ from .metop_mhs import MetOpMHS
 from .mrms import MRMS
 from .ncar import NCAR_ERA5
 from .nclimgrid import NClimGridDaily
-from .nnja import NNJAObsConv
+from .nnja import NNJAGPSRO, NNJAObsConv
 from .opera import OPERA
 from .planetary_computer import (
     PlanetaryComputerECMWFOpenDataIFS,
@@ -60,6 +60,8 @@ from .rx import CosineSolarZenith, LandSeaMask, SurfaceGeoPotential
 from .time_window import TimeWindow
 from .ufs import UFSObsConv, UFSObsSat
 from .utils import datasource_to_file, fetch_data, fetch_dataframe, prep_data_array
+from .utils_bufr import BUFRDecoder, PyBufrKitDecoder
+from .utils_ncep_gpsro import NCEP_GPSRO_PROFILE_SCHEMA
 from .wb2 import WB2ERA5, WB2Climatology, WB2ERA5_32x64, WB2ERA5_121x240
 from .xr import (
     DataArrayDirectory,

@@ -25,25 +25,138 @@ registration) used by :mod:`earth2studio.data.gdas` and
 from __future__ import annotations
 
 import contextlib
+import numbers
 import os
 import struct
 import sys
 from collections.abc import Iterator
-from typing import Any
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
+import pyarrow as pa
 from loguru import logger
 
 from earth2studio.utils.imports import (
     OptionalDependencyFailure,
+    check_optional_dependencies,
 )
 
 # Shared optional-dependency key for pybufrkit. NCEP conventional sources decode
 # through this module, so their public classes check this key.
 BUFR_DEPENDENCY_KEY = "bufr"
 
+RAW_BUFR_ELEMENT_TYPE = pa.struct(
+    [
+        pa.field("descriptor_id", pa.int32()),
+        pa.field("field_name", pa.string()),
+        pa.field("numeric_value", pa.float64()),
+        pa.field("string_value", pa.string()),
+        pa.field("bytes_value", pa.binary()),
+    ]
+)
+
+RAW_BUFR_SCHEMA = pa.schema(
+    [
+        pa.field("message_index", pa.uint32(), nullable=False),
+        pa.field("subset_index", pa.uint32(), nullable=False),
+        pa.field("data_category", pa.uint8(), nullable=False),
+        pa.field(
+            "elements",
+            pa.list_(RAW_BUFR_ELEMENT_TYPE),
+            nullable=False,
+        ),
+    ]
+)
+
+
+@runtime_checkable
+class BUFRDecoder(Protocol):
+    """Decoder interface for raw BUFR subsets.
+
+    Implementations decode BUFR mechanics only and preserve source field names,
+    order, and replication structure in Arrow. Product-specific interpretation,
+    filtering, and output schemas remain the responsibility of the caller.
+    """
+
+    def decode_file(self, path: str | Path) -> list[pa.RecordBatch]:
+        """Decode a BUFR file into raw Arrow batches.
+
+        Parameters
+        ----------
+        path : str | Path
+            Local BUFR file.
+
+        Returns
+        -------
+        list[pa.RecordBatch]
+            Raw decoded batches preserving BUFR field and replication structure.
+        """
+        ...
+
+
+def validate_bufr_batches(
+    batches: list[pa.RecordBatch],
+) -> list[pa.RecordBatch]:
+    """Validate the container contract for decoded BUFR batches.
+
+    Parameters
+    ----------
+    batches : list[pa.RecordBatch]
+        Decoder output.
+
+    Returns
+    -------
+    list[pa.RecordBatch]
+        The validated batches.
+
+    Raises
+    ------
+    TypeError
+        If a decoder returns a non-batch value.
+    """
+    for batch in batches:
+        if not isinstance(batch, pa.RecordBatch):
+            raise TypeError(
+                "BUFR decoder must return a list of pyarrow.RecordBatch objects"
+            )
+    return batches
+
+
+def validate_raw_bufr_batches(
+    batches: list[pa.RecordBatch],
+) -> list[pa.RecordBatch]:
+    """Validate batches against the default raw BUFR interchange schema.
+
+    Parameters
+    ----------
+    batches : list[pa.RecordBatch]
+        Default-decoder output.
+
+    Returns
+    -------
+    list[pa.RecordBatch]
+        The validated batches.
+
+    Raises
+    ------
+    TypeError
+        If a batch has an incompatible schema.
+    """
+    validate_bufr_batches(batches)
+    for batch in batches:
+        if batch.schema != RAW_BUFR_SCHEMA:
+            raise TypeError(
+                f"BUFR decoder returned an incompatible schema: {batch.schema}"
+            )
+    return batches
+
+
 try:
-    from pybufrkit.decoder import Decoder as BufrDecoder
-    from pybufrkit.tables import TableGroupCacheManager
+    from pybufrkit.decoder import Decoder as BufrDecoder  # type: ignore[import-untyped]
+    from pybufrkit.tables import (  # type: ignore[import-untyped]
+        TableGroupCacheManager,
+    )
 except ImportError:
     OptionalDependencyFailure("data", BUFR_DEPENDENCY_KEY)
     BufrDecoder = None  # type: ignore[assignment,misc]
@@ -521,3 +634,111 @@ def get_worker_decoder() -> Any:
         The decoder created by :func:`init_decode_worker`.
     """
     return _worker_decoder
+
+
+def _raw_element(descriptor: Any, value: Any) -> dict[str, Any]:
+    descriptor_name = getattr(descriptor, "name", None)
+    name = (
+        str(descriptor_name).strip().split(maxsplit=1)[0] if descriptor_name else None
+    )
+    element: dict[str, Any] = {
+        "descriptor_id": int(descriptor.id),
+        "field_name": name,
+        "numeric_value": None,
+        "string_value": None,
+        "bytes_value": None,
+    }
+    if isinstance(value, bytes):
+        element["bytes_value"] = value
+    elif isinstance(value, str):
+        element["string_value"] = value
+    elif isinstance(value, numbers.Real):
+        element["numeric_value"] = float(value)
+    elif value is not None:
+        element["string_value"] = str(value)
+    return element
+
+
+def _decode_raw_message(
+    work: tuple[int, bytes, int],
+) -> list[dict[str, Any]]:
+    message_index, message_bytes, data_category = work
+    with silence_bufr_noise():
+        message = _worker_decoder.process(message_bytes)
+    if not message.n_subsets.value:
+        return []
+
+    template = message.template_data.value
+    rows: list[dict[str, Any]] = []
+    for subset_index, (descriptors, values) in enumerate(
+        zip(
+            template.decoded_descriptors_all_subsets,
+            template.decoded_values_all_subsets,
+            strict=True,
+        )
+    ):
+        rows.append(
+            {
+                "message_index": message_index,
+                "subset_index": subset_index,
+                "data_category": data_category,
+                "elements": [
+                    _raw_element(descriptor, value)
+                    for descriptor, value in zip(descriptors, values, strict=True)
+                ],
+            }
+        )
+    return rows
+
+
+@check_optional_dependencies(BUFR_DEPENDENCY_KEY)
+class PyBufrKitDecoder:
+    """Decode BUFR files into the canonical raw Arrow representation.
+
+    Parameters
+    ----------
+    decode_workers : int, optional
+        Number of parallel message-decoding processes, by default 8.
+    """
+
+    def __init__(self, decode_workers: int = 8) -> None:
+        self.decode_workers = max(1, decode_workers)
+
+    def decode_file(self, path: str | Path) -> list[pa.RecordBatch]:
+        """Decode one BUFR file without product-specific interpretation.
+
+        Parameters
+        ----------
+        path : str | Path
+            Local BUFR file.
+
+        Returns
+        -------
+        list[pa.RecordBatch]
+            Raw decoded subsets with :data:`RAW_BUFR_SCHEMA`.
+        """
+        table_b, table_d, messages = parse_prepbufr_messages(
+            Path(path).read_bytes(), silence_noise=True
+        )
+        work = [
+            (message_index, message_bytes, data_category)
+            for message_index, (message_bytes, data_category) in enumerate(messages)
+        ]
+        rows: list[dict[str, Any]] = []
+        if self.decode_workers == 1:
+            init_decode_worker(table_b, table_d)
+            for message_rows in map(_decode_raw_message, work):
+                rows.extend(message_rows)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=self.decode_workers,
+                initializer=init_decode_worker,
+                initargs=(table_b, table_d),
+            ) as pool:
+                for message_rows in pool.map(_decode_raw_message, work, chunksize=1):
+                    rows.extend(message_rows)
+
+        if not rows:
+            return []
+        table = pa.Table.from_pylist(rows, schema=RAW_BUFR_SCHEMA)
+        return validate_raw_bufr_batches(table.to_batches(max_chunksize=256))
