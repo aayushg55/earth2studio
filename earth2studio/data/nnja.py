@@ -592,7 +592,7 @@ class NNJAObsSat(_NNJAObsSourceBase):
     channel number, not a dense index into a selected channel list.
 
     ``atms`` returns the encoded 22-channel ``TMBR`` scene brightness
-    temperature. ``atms_antenna_temperature`` returns the corresponding
+    temperature. ``atms_antenna`` returns the corresponding
     encoded ``TMANT`` antenna temperature. No conversion is performed between
     those two ATMS products.
 
@@ -665,7 +665,7 @@ class NNJAObsSat(_NNJAObsSourceBase):
         source = NNJAObsSat(satellites=["n20"])
         df = source(
             datetime(2024, 1, 1),
-            ["atms", "atms_antenna_temperature"],
+            ["atms", "atms_antenna"],
         )
 
     Badges

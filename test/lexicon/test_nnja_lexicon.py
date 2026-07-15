@@ -68,7 +68,7 @@ def test_nnja_obs_conv_lexicon_routes():
 def test_nnja_obs_sat_lexicon_routes_and_quantity_identity():
     assert NNJAObsSatLexicon.VOCAB == {
         "atms": "atms::TMBR",
-        "atms_antenna_temperature": "atms::TMANT",
+        "atms_antenna": "atms::TMANT",
         "mhs": "mhs::TMBR",
         "amsua": "amsua::TMBR",
         "amsub": "amsub::TMBR",

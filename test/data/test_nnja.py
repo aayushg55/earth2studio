@@ -770,16 +770,16 @@ def test_nnja_obs_sat_decode_preserves_encoded_atms_quantities_and_identity():
         _atms_microwave_pairs(),
         (
             ("atms", ncep_microwave._BRIGHTNESS_TEMPERATURE),
-            ("atms_antenna_temperature", ncep_microwave._ANTENNA_TEMPERATURE),
+            ("atms_antenna", ncep_microwave._ANTENNA_TEMPERATURE),
         ),
     )
 
     assert [row["sensor_index"] for row in rows] == [2, 2, 1, 1]
     assert [row["variable"] for row in rows] == [
         "atms",
-        "atms_antenna_temperature",
+        "atms_antenna",
         "atms",
-        "atms_antenna_temperature",
+        "atms_antenna",
     ]
     assert [row["observation"] for row in rows] == pytest.approx(
         [202.5, 201.25, 191.5, 190.25]
@@ -1174,14 +1174,14 @@ def test_nnja_obs_sat_tasks_group_fields_and_use_verified_archive_routes():
     )
     cycle = datetime(2024, 1, 1)
     tasks = source._create_tasks(
-        [cycle], ["atms", "atms_antenna_temperature", "mhs", "amsua", "amsub"]
+        [cycle], ["atms", "atms_antenna", "mhs", "amsua", "amsub"]
     )
 
     assert len(tasks) == 4
     atms = next(task for task in tasks if task.sensor == "atms")
     assert atms.var_plan == {
         "atms": "TMBR",
-        "atms_antenna_temperature": "TMANT",
+        "atms_antenna": "TMANT",
     }
     assert atms.datetime_min == cycle
     assert atms.datetime_max == cycle
