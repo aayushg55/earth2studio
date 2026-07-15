@@ -1064,7 +1064,12 @@ def test_nnja_obs_sat_decode_uses_coarse_location_and_preserves_missingness():
 @pytest.mark.asyncio
 async def test_nnja_obs_sat_fetch_uses_foundation_store(tmp_path, monkeypatch):
     monkeypatch.setenv("EARTH2STUDIO_CACHE", str(tmp_path))
-    source = NNJAObsSat(cache=True, verbose=False, decode_workers=1)
+    source = NNJAObsSat(
+        time_tolerance=timedelta(0),
+        cache=True,
+        verbose=False,
+        decode_workers=1,
+    )
     local_path = tmp_path / "atms.bufr"
     local_path.write_bytes(b"fixture")
     monkeypatch.setattr(source._store, "local_path", lambda _uri: str(local_path))
@@ -1096,7 +1101,12 @@ async def test_nnja_obs_sat_fetch_uses_foundation_store(tmp_path, monkeypatch):
 async def test_nnja_obs_sat_fetch_and_task_failures_are_structured(
     tmp_path, monkeypatch
 ):
-    source = NNJAObsSat(cache=True, verbose=False, decode_workers=1)
+    source = NNJAObsSat(
+        time_tolerance=timedelta(0),
+        cache=True,
+        verbose=False,
+        decode_workers=1,
+    )
     requested_uri = source._build_satellite_uri(datetime(2024, 1, 1), "atms")
 
     async def failed_fetch(_uris):
