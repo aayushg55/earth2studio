@@ -4,6 +4,18 @@ HealDA-v2 currently uses random weights and generated normalization, PCA, and
 static-conditioning assets. These examples exercise the inference pipeline but
 do not produce a scientifically valid analysis.
 
+## Installation
+
+Install the HealDA-v2 extra from the repository:
+
+```bash
+pip install -e ".[da-healda-v2]"
+```
+
+The extra installs the pinned PhysicsNeMo Git revision required for
+`VideoHealDA` and context-parallel inference. PhysicsNeMo 2.1.1 does not
+provide HealDA-v2.
+
 ## Real UFS replay observations
 
 Save this as `run_healda_v2_real.py`:
