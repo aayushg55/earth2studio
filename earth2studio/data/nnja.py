@@ -37,8 +37,9 @@ import s3fs  # type: ignore[import-untyped]
 from loguru import logger
 
 from earth2studio.data.ncep_obs import (
-    _NCEP_MICROWAVE_OUTPUT_SCHEMA,
-    _NCEP_MICROWAVE_SATELLITES,
+    _NCEP_SATELLITE_OUTPUT_SCHEMA,
+    _NCEP_SATELLITES,
+    _NCEPInfraredAdapter,
     _NCEPMicrowaveAdapter,
     _NCEPObsSourceBase,
 )
@@ -68,6 +69,7 @@ class _NNJASatProduct:
     prefix: str
     filename: str
     first_year: int
+    last_cycle: datetime | None = None
 
 
 class _NNJAObsSatIncompleteError(RuntimeError):
@@ -81,6 +83,14 @@ _NNJA_SAT_PRODUCTS: dict[str, _NNJASatProduct] = {
     "mhs": _NNJASatProduct("mhs/1bmhs", "1bmhs", 2005),
     "amsua": _NNJASatProduct("amsua/1bamua", "1bamua", 1998),
     "amsub": _NNJASatProduct("amsub/1bamub", "1bamub", 1998),
+    "iasi": _NNJASatProduct("iasi/mtiasi", "mtiasi", 2007),
+    "crisfsr": _NNJASatProduct("cris/crisf4", "crisf4", 2012),
+    "airs": _NNJASatProduct(
+        "airs/nasa/aqua",
+        "airs_disc_final",
+        2002,
+        datetime(2023, 1, 18, 6),
+    ),
 }
 
 # ── Async-task dataclasses ──────────────────────────────────────────
@@ -114,7 +124,7 @@ class _NNJAGpsRoTask:
 
 @dataclass
 class _NNJASatTask:
-    """Async task for one aggregate microwave cycle file."""
+    """Async task for one aggregate satellite cycle file."""
 
     s3_uri: str
     datetime_file: datetime
@@ -122,6 +132,7 @@ class _NNJASatTask:
     datetime_max: datetime
     sensor: str
     var_plan: dict[str, str] = field(default_factory=dict)
+    sensor_indices: tuple[int, ...] | None = None
 
 
 class _NNJAObsStore:
@@ -584,12 +595,12 @@ class NNJAObsConv(_NNJAObsSourceBase):
 
 @check_optional_dependencies(BUFR_DEPENDENCY_KEY)
 class NNJAObsSat(_NNJAObsSourceBase):
-    """NNJA historical NCEP aggregate microwave satellite observations.
+    """NNJA historical NCEP aggregate satellite observations.
 
-    This source reads the NCEP six-hour aggregate ATMS, MHS, AMSU-A, and AMSU-B
-    BUFR products from the NNJA archive. It returns one long-format row per
-    finite encoded channel value. ``sensor_index`` is the physical ``CHNM``
-    channel number, not a dense index into a selected channel list.
+    This source reads NCEP six-hour aggregate microwave and infrared BUFR
+    products from the NNJA archive. It returns one long-format row per finite
+    channel value. ``sensor_index`` is the physical ``CHNM`` channel number,
+    not a dense index into a selected channel list.
 
     ``atms`` returns the encoded 22-channel ``TMBR`` scene brightness
     temperature. ``atms_antenna`` returns the corresponding
@@ -605,10 +616,18 @@ class NNJAObsSat(_NNJAObsSourceBase):
     confirms that exception for AMSU-A. The platform identity is retained so a
     downstream transform can apply the appropriate convention explicitly.
 
-    ``scan_position`` preserves the encoded one-based FOV number.
-    ``scan_angle`` is the signed nominal instrument look angle derived from
-    that FOV; negative values are on the first half of the scan. The encoded
-    ``satellite_za`` remains the unsigned Earth-view zenith magnitude.
+    ``iasi`` applies each footprint's encoded C0616 radiance scale groups and
+    the CRTM 2.4 inverse Planck convention used by NCEP. ``crisfsr`` applies the
+    same convention to the already apodized C0431 ``CRCHNM/SRAD`` radiances; it
+    does not apply a second Hamming transform. ``airs`` returns the encoded
+    281-channel TMBR brightness temperatures.
+
+    ``scan_position`` is the one-based cross-track position used by NCEP: the
+    encoded FOV for microwave and AIRS, the remapped 1--60 IASI position, and
+    the 1--30 CrIS field of regard. ``scan_angle`` is the signed nominal look
+    angle, including the CrIS detector offset; negative values are on the first
+    half of the scan. The encoded ``satellite_za`` remains the unsigned
+    Earth-view zenith magnitude.
 
     Parameters
     ----------
@@ -619,6 +638,9 @@ class NNJAObsSat(_NNJAObsSourceBase):
     satellites : list[str] | None, optional
         Satellite platforms to include. ``None`` includes every platform in
         the requested aggregate files.
+    sensor_indices : list[int] | np.ndarray | None, optional
+        Physical channel numbers to retain before long-format expansion.
+        ``None`` retains every channel carried by each requested NCEP product.
     cache : bool, optional
         Cache downloaded files in the local filesystem cache, by default True.
     verbose : bool, optional
@@ -644,7 +666,7 @@ class NNJAObsSat(_NNJAObsSourceBase):
 
     Note
     ----
-    Additional information on the archive and microwave product semantics:
+    Additional information on the archive and product semantics:
 
     - https://psl.noaa.gov/data/nnja_obs/
     - https://registry.opendata.aws/noaa-reanalyses-pds/
@@ -655,6 +677,10 @@ class NNJAObsSat(_NNJAObsSourceBase):
     - https://www.star.nesdis.noaa.gov/jpss/documents/ATBD/D0001-M01-S01-001_JPSS_ATBD_ATMS-SDR_B.pdf
     - https://user.eumetsat.int/s3/ope-eup-strapi-media/ATOVS_Level_1b_Product_Guide_f89971ac20.pdf
     - https://www.ncei.noaa.gov/pub/data/cdo/documentation/podguides/N-15%20thru%20N-19/pdf/APPENDIX%20J%20Instrument%20Scan%20Properties.pdf
+    - https://github.com/NOAA-EMC/GSI/blob/860d13740352004fca0136a8c3d0ac9dea30e0da/src/gsi/read_iasi.f90#L700-L770
+    - https://github.com/NOAA-EMC/GSI/blob/860d13740352004fca0136a8c3d0ac9dea30e0da/src/gsi/read_cris.f90#L720-L815
+    - https://github.com/NOAA-EMC/GSI/blob/860d13740352004fca0136a8c3d0ac9dea30e0da/src/gsi/read_airs.f90#L571-L615
+    - https://github.com/JCSDA/crtm/blob/v2.4.0/src/Source_Functions/CRTM_Planck_Functions.f90#L470-L489
 
     Example
     -------
@@ -674,14 +700,15 @@ class NNJAObsSat(_NNJAObsSourceBase):
     """
 
     SOURCE_ID = "earth2studio.data.NNJAObsSat"
-    SCHEMA = _NCEP_MICROWAVE_OUTPUT_SCHEMA
+    SCHEMA = _NCEP_SATELLITE_OUTPUT_SCHEMA
     MIN_DATE = datetime(1998, 1, 1)
-    VALID_SATELLITES = _NCEP_MICROWAVE_SATELLITES
+    VALID_SATELLITES = _NCEP_SATELLITES
 
     def __init__(
         self,
         time_tolerance: TimeTolerance = np.timedelta64(3, "h"),
         satellites: list[str] | None = None,
+        sensor_indices: list[int] | np.ndarray | None = None,
         cache: bool = True,
         verbose: bool = True,
         async_timeout: int = 600,
@@ -700,6 +727,24 @@ class NNJAObsSat(_NNJAObsSourceBase):
                 )
             self._satellites = tuple(sorted(set(satellites)))
 
+        if sensor_indices is None:
+            self._sensor_indices: tuple[int, ...] | None = None
+        else:
+            requested = tuple(sensor_indices)
+            normalized = tuple(int(channel) for channel in requested)
+            if not normalized:
+                raise ValueError("sensor_indices must contain at least one channel")
+            if any(
+                channel != original or channel < 1 or channel > 65535
+                for channel, original in zip(normalized, requested)
+            ):
+                raise ValueError(
+                    "sensor_indices must contain positive integer channel numbers"
+                )
+            if len(set(normalized)) != len(normalized):
+                raise ValueError("sensor_indices must be unique")
+            self._sensor_indices = normalized
+
         super().__init__(
             time_tolerance=time_tolerance,
             cache=cache,
@@ -710,6 +755,7 @@ class NNJAObsSat(_NNJAObsSourceBase):
             retries=retries,
         )
         self._microwave_adapter = _NCEPMicrowaveAdapter(self._decode_workers)
+        self._infrared_adapter = _NCEPInfraredAdapter(self._decode_workers)
 
     @staticmethod
     def _task_uri(task: _NNJASatTask) -> str:
@@ -771,6 +817,15 @@ class NNJAObsSat(_NNJAObsSourceBase):
                         cycle=cycle.isoformat(),
                         first_year=product.first_year,
                     )
+                if product.last_cycle is not None and cycle > product.last_cycle:
+                    uri = self._build_satellite_uri(cycle, sensor)
+                    raise _NNJAObsSatIncompleteError(
+                        "archive_unavailable",
+                        uri=uri,
+                        sensor=sensor,
+                        cycle=cycle.isoformat(),
+                        last_cycle=product.last_cycle.isoformat(),
+                    )
                 tasks.append(
                     _NNJASatTask(
                         s3_uri=self._build_satellite_uri(cycle, sensor),
@@ -779,18 +834,24 @@ class NNJAObsSat(_NNJAObsSourceBase):
                         datetime_max=datetime_max,
                         sensor=sensor,
                         var_plan=var_plan,
+                        sensor_indices=self._sensor_indices,
                     )
                 )
         return tasks
 
     @staticmethod
     def _build_satellite_uri(cycle: datetime, sensor: str) -> str:
-        """Build the NNJA S3 URI for one aggregate microwave cycle."""
+        """Build the NNJA S3 URI for one aggregate satellite cycle."""
         product = _NNJA_SAT_PRODUCTS[sensor]
+        if sensor == "airs":
+            filename = f"airs_disc_final.{cycle:%Y%m%d}.t{cycle:%H}z.bufr"
+        else:
+            filename = (
+                f"gdas.{cycle:%Y%m%d}.t{cycle:%H}z.{product.filename}.tm00.bufr_d"
+            )
         return (
             f"s3://{NNJA_BUCKET}/{NNJA_PREFIX}/{product.prefix}/"
-            f"{cycle:%Y/%m}/bufr/gdas.{cycle:%Y%m%d}.t{cycle:%H}z."
-            f"{product.filename}.tm00.bufr_d"
+            f"{cycle:%Y/%m}/bufr/{filename}"
         )
 
     def _handle_missing_file(self, path: str) -> None:
@@ -798,12 +859,18 @@ class NNJAObsSat(_NNJAObsSourceBase):
         raise _NNJAObsSatIncompleteError("remote_file_missing", uri=path)
 
     def _decode_file(self, local_path: str, task: _NNJASatTask) -> pd.DataFrame:
-        frame = self._microwave_adapter.decode_file(
+        adapter = (
+            self._infrared_adapter
+            if task.sensor in {"iasi", "crisfsr", "airs"}
+            else self._microwave_adapter
+        )
+        frame = adapter.decode_file(
             local_path,
             task.sensor,
             task.var_plan,
             task.datetime_min,
             task.datetime_max,
             self._satellites,
+            task.sensor_indices,
         )
         return frame[self.SCHEMA.names]

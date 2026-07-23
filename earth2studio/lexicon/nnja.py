@@ -178,11 +178,13 @@ class NNJAObsConvLexicon(metaclass=LexiconType):
 
 
 class NNJAObsSatLexicon(metaclass=LexiconType):
-    """NNJA aggregate microwave observation lexicon.
+    """NNJA aggregate satellite observation lexicon.
 
     ``atms`` selects encoded ``TMBR`` scene brightness temperature, while
     ``atms_antenna`` selects encoded ``TMANT`` antenna temperature.
     The legacy sounder names select their encoded ``TMBR`` fields unchanged.
+    IASI and CrIS-FSR select aggregate radiances converted to brightness
+    temperature by the datasource; AIRS selects encoded ``TMBR``.
 
     Note
     ----
@@ -196,6 +198,9 @@ class NNJAObsSatLexicon(metaclass=LexiconType):
         "mhs": "mhs::TMBR",
         "amsua": "amsua::TMBR",
         "amsub": "amsub::TMBR",
+        "iasi": "iasi::SCRA",
+        "crisfsr": "crisfsr::SRAD",
+        "airs": "airs::TMBR",
     }
 
     @classmethod
@@ -210,8 +215,8 @@ class NNJAObsSatLexicon(metaclass=LexiconType):
         Returns
         -------
         tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]
-            Aggregate sensor/field route and an identity modifier. Encoded
-            microwave temperatures are already in kelvin.
+            Aggregate sensor/field route and an identity modifier. The
+            datasource returns all public satellite variables in kelvin.
         """
         source_key = cls.VOCAB[val]
 

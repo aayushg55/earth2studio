@@ -28,9 +28,43 @@ import pytest
 
 import earth2studio.data.ncep_obs as ncep_microwave
 import earth2studio.data.nnja as nnja
+import earth2studio.data.utils_bufr as utils_bufr
 from earth2studio.data import NNJAObsConv, NNJAObsSat, utils_ncep
 
 pytest.importorskip("pybufrkit", reason="pybufrkit not installed")
+
+
+def _minimal_bufr_message(category: int) -> bytes:
+    message = bytearray(21)
+    message[:4] = b"BUFR"
+    message[4:7] = len(message).to_bytes(3, "big")
+    message[7] = 4
+    message[16] = category
+    message[-4:] = b"7777"
+    return bytes(message)
+
+
+def test_ncep_bufr_iterator_preserves_identity_and_rejects_truncation(tmp_path):
+    first = _minimal_bufr_message(11)
+    second = _minimal_bufr_message(21)
+    path = tmp_path / "complete.bufr"
+    path.write_bytes(first + b"\x00" * 3 + second + b"\x00" * 7)
+
+    messages = list(utils_bufr.iter_ncep_bufr_messages(path))
+
+    assert [(item.index, item.byte_offset, item.category) for item in messages] == [
+        (0, 0, 11),
+        (1, len(first) + 3, 21),
+    ]
+    assert [item.data for item in messages] == [first, second]
+
+    path.write_bytes(first + second[:-1])
+    with pytest.raises(ValueError, match="Truncated BUFR message"):
+        list(utils_bufr.iter_ncep_bufr_messages(path))
+
+    path.write_bytes(first + b"bad")
+    with pytest.raises(ValueError, match="Invalid trailing bytes"):
+        list(utils_bufr.iter_ncep_bufr_messages(path))
 
 
 @pytest.mark.slow
@@ -714,6 +748,7 @@ def _decode_microwave_pairs(
         datetime_min,
         datetime_max,
         satellites,
+        None,
     )
 
 
@@ -847,6 +882,164 @@ def test_ncep_microwave_nominal_scan_geometry(
     ) == pytest.approx(expected)
 
 
+def _infrared_scalar_pairs(satellite_id: int, field_of_view: int):
+    return [
+        (ncep_microwave._YEAR, 2024),
+        (ncep_microwave._MONTH, 1),
+        (ncep_microwave._DAY, 1),
+        (ncep_microwave._HOUR, 0),
+        (ncep_microwave._MINUTE, 1),
+        (ncep_microwave._SECOND, 2.25),
+        (ncep_microwave._LAT_HIGH, 12.5),
+        (ncep_microwave._LON_HIGH, -45.0),
+        (ncep_microwave._SAID, satellite_id),
+        (ncep_microwave._FOV_NUMBER, field_of_view),
+        (ncep_microwave._SCAN_LINE, 8),
+        (ncep_microwave._SATELLITE_ZENITH, 50.0),
+        (ncep_microwave._BEARING_OR_AZIMUTH, 270.0),
+        (ncep_microwave._SOLAR_ZENITH, 100.0),
+        (ncep_microwave._SOLAR_AZIMUTH, 150.0),
+    ]
+
+
+def _decode_infrared_pairs(
+    sensor: str,
+    pairs: list[tuple[int, Any]],
+    requested_channels: tuple[int, ...],
+):
+    return ncep_microwave._decode_infrared_subset(
+        [_MicrowaveDescriptor(descriptor) for descriptor, _ in pairs],
+        [value for _, value in pairs],
+        sensor,
+        sensor,
+        requested_channels,
+        datetime(2023, 12, 31, 21),
+        datetime(2024, 1, 1, 3),
+        None,
+    )
+
+
+def test_ncep_infrared_decodes_iasi_scale_groups_before_projection():
+    pairs = _infrared_scalar_pairs(3, 1)
+    pairs.append((ncep_microwave._IR_PROFILE_QUALITY, 2))
+    for start in range(1, 617, 62):
+        pairs.extend(
+            [
+                (ncep_microwave._IR_START_CHANNEL, start),
+                (ncep_microwave._IR_END_CHANNEL, min(start + 61, 616)),
+                (ncep_microwave._IR_CHANNEL_SCALE_FACTOR, 5),
+            ]
+        )
+    assert (
+        sum(descriptor == ncep_microwave._IR_START_CHANNEL for descriptor, _ in pairs)
+        == 10
+    )
+    for channel in range(1, 617):
+        pairs.extend(
+            [
+                (ncep_microwave._CHANNEL_NUMBER, channel),
+                (ncep_microwave._IR_SCALED_RADIANCE, 10.0 + channel / 1000.0),
+            ]
+        )
+
+    rows = _decode_infrared_pairs("iasi", pairs, (1, 616))
+
+    assert [row["sensor_index"] for row in rows] == [1, 616]
+    assert {row["satellite"] for row in rows} == {"metop-b"}
+    assert {row["quality"] for row in rows} == {2}
+    assert all(np.isnan(row["elev"]) for row in rows)
+    assert rows[0]["scan_position"] == 1
+    assert rows[0]["scan_angle"] == pytest.approx(-47.705)
+
+
+def test_ncep_infrared_preserves_null_iasi_scale_group_positions():
+    pairs = _infrared_scalar_pairs(3, 1)
+    scale_groups = [
+        (16, 148, None),
+        (149, 215, 5),
+        (216, 282, 5),
+        (283, 349, 5),
+        (350, 416, 6),
+        (417, 483, 7),
+        (484, 550, 8),
+        (551, 617, 9),
+        (618, 630, 9),
+        (5480, 5480, 9),
+    ]
+    for start, end, exponent in scale_groups:
+        pairs.extend(
+            [
+                (ncep_microwave._IR_START_CHANNEL, start),
+                (ncep_microwave._IR_END_CHANNEL, end),
+                (ncep_microwave._IR_CHANNEL_SCALE_FACTOR, exponent),
+            ]
+        )
+    channels = list(range(16, 631)) + [5480]
+    for channel in channels:
+        pairs.extend(
+            [
+                (ncep_microwave._CHANNEL_NUMBER, channel),
+                (ncep_microwave._IR_SCALED_RADIANCE, 6470 if channel == 5480 else 0),
+            ]
+        )
+
+    rows = _decode_infrared_pairs("iasi", pairs, (5480,))
+
+    assert len(rows) == 1
+    assert rows[0]["observation"] == pytest.approx(243.143372, abs=1e-6)
+
+
+def test_ncep_infrared_decodes_only_named_cris_replication():
+    pairs = _infrared_scalar_pairs(225, 5)
+    pairs.extend(
+        [
+            (ncep_microwave._IR_FIELD_OF_REGARD, 2),
+            (ncep_microwave._SURFACE_ELEVATION, 123.0),
+            (ncep_microwave._IR_DELAYED_REPLICATION_16, 2),
+            (ncep_microwave._CHANNEL_NUMBER, 24),
+            (ncep_microwave._IR_SPECTRAL_RADIANCE, 0.01),
+            (ncep_microwave._CHANNEL_NUMBER, 1058),
+            (ncep_microwave._IR_SPECTRAL_RADIANCE, 0.02),
+            # A later unrelated CHNM sequence must not enter CRCHNM.
+            (ncep_microwave._CHANNEL_NUMBER, 9999),
+            (ncep_microwave._IR_SPECTRAL_RADIANCE, 1.0),
+        ]
+    )
+
+    rows = _decode_infrared_pairs("crisfsr", pairs, (24, 1058))
+
+    assert [row["sensor_index"] for row in rows] == [24, 1058]
+    assert {row["satellite"] for row in rows} == {"n20"}
+    assert {row["elev"] for row in rows} == {123.0}
+    assert {row["scan_position"] for row in rows} == {2}
+    assert all(row["quality"] is None for row in rows)
+
+
+def test_ncep_infrared_preserves_airs_channel_quality_and_wavenumber():
+    pairs = _infrared_scalar_pairs(784, 90)
+    pairs.extend(
+        [
+            (ncep_microwave._IR_DELAYED_REPLICATION_16, 2),
+            (ncep_microwave._CHANNEL_NUMBER, 7),
+            (ncep_microwave._IR_AIRS_LOG_WAVENUMBER, np.log10(65000.0)),
+            (ncep_microwave._IR_AIRS_ACQUISITION_QUALITY, 0),
+            (ncep_microwave._BRIGHTNESS_TEMPERATURE, 240.0),
+            (ncep_microwave._CHANNEL_NUMBER, 1928),
+            (ncep_microwave._IR_AIRS_LOG_WAVENUMBER, np.log10(220000.0)),
+            (ncep_microwave._IR_AIRS_ACQUISITION_QUALITY, 3),
+            (ncep_microwave._BRIGHTNESS_TEMPERATURE, 280.0),
+        ]
+    )
+
+    rows = _decode_infrared_pairs("airs", pairs, (7, 1928))
+
+    assert [row["sensor_index"] for row in rows] == [7, 1928]
+    assert [row["wavenumber"] for row in rows] == pytest.approx([650.0, 2200.0])
+    assert [row["quality"] for row in rows] == [0, 3]
+    assert {row["satellite"] for row in rows} == {"aqua"}
+    assert rows[0]["scan_angle"] == pytest.approx(49.0)
+
+
 def test_nnja_obs_sat_decode_preserves_amsub_channels_and_quantity():
     pairs = [
         (descriptor, 207 if descriptor == ncep_microwave._SAID else value)
@@ -947,6 +1140,7 @@ def test_ncep_microwave_message_preserves_mixed_satellite_order(monkeypatch):
             (("mhs", ncep_microwave._BRIGHTNESS_TEMPERATURE),),
             datetime(2023, 12, 31, 21),
             datetime(2024, 1, 1, 3),
+            None,
             None,
         )
     )
@@ -1199,6 +1393,33 @@ def test_nnja_obs_sat_tasks_group_fields_and_use_verified_archive_routes():
     amsub = next(task for task in tasks if task.sensor == "amsub")
     assert amsub.var_plan == {"amsub": "TMBR"}
     assert amsub.s3_uri.endswith("gdas.20240101.t00z.1bamub.tm00.bufr_d")
+
+
+def test_nnja_obs_sat_ir_tasks_use_projection_and_product_routes():
+    source = NNJAObsSat(
+        time_tolerance=timedelta(0),
+        sensor_indices=[7, 98],
+        cache=False,
+        verbose=False,
+        decode_workers=1,
+    )
+    cycle = datetime(2021, 1, 1)
+    tasks = source._create_tasks([cycle], ["iasi", "crisfsr", "airs"])
+
+    assert {task.sensor for task in tasks} == {"iasi", "crisfsr", "airs"}
+    assert all(task.sensor_indices == (7, 98) for task in tasks)
+    uris = {task.sensor: task.s3_uri for task in tasks}
+    assert uris["iasi"].endswith("gdas.20210101.t00z.mtiasi.tm00.bufr_d")
+    assert uris["crisfsr"].endswith("gdas.20210101.t00z.crisf4.tm00.bufr_d")
+    assert uris["airs"].endswith("airs_disc_final.20210101.t00z.bufr")
+
+    with pytest.raises(ValueError, match="at least one"):
+        NNJAObsSat(sensor_indices=[])
+    with pytest.raises(ValueError, match="unique"):
+        NNJAObsSat(sensor_indices=[7, 7])
+    with pytest.raises(nnja._NNJAObsSatIncompleteError) as unavailable:
+        source._create_tasks([datetime(2024, 1, 1)], ["airs"])
+    assert unavailable.value.context["last_cycle"] == "2023-01-18T06:00:00"
 
 
 def test_nnja_obs_sat_cycle_windows_follow_nnja_cycle_selection():

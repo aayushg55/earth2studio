@@ -14,21 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared PrepBUFR parsing utilities for NCEP-format BUFR files.
+"""Shared parsing utilities for NCEP-format BUFR files.
 
-This module provides common helpers for decoding NCEP PrepBUFR files
-(DX table extraction, message splitting, and pybufrkit table
-registration) used by :mod:`earth2studio.data.gdas` and
-:mod:`earth2studio.data.nnja`.
+This module provides common helpers for complete-message streaming, DX table
+extraction, message splitting, and pybufrkit table registration used by
+:mod:`earth2studio.data.gdas` and :mod:`earth2studio.data.nnja`.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import pathlib
 import struct
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -48,6 +49,10 @@ except ImportError:
     OptionalDependencyFailure("data", BUFR_DEPENDENCY_KEY)
     BufrDecoder = None  # type: ignore[assignment,misc]
     TableGroupCacheManager = None  # type: ignore[assignment,misc]
+
+
+_NCEP_BUFR_READ_SIZE = 1024 * 1024
+_MAX_NCEP_BUFR_MESSAGE_SIZE = (1 << 24) - 1
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -227,6 +232,113 @@ def _str(v: Any) -> str:
 def fxy_to_id(f: Any, x: Any, y: Any) -> int:
     """Convert F, X, Y fields to an integer BUFR descriptor ID."""
     return safe_int(f) * 100000 + safe_int(x) * 1000 + safe_int(y)
+
+
+@dataclass(frozen=True)
+class NCEPBufrMessage:
+    """One complete NCEP BUFR message and its source-file identity."""
+
+    index: int
+    byte_offset: int
+    category: int
+    data: bytes
+
+
+def iter_ncep_bufr_messages(
+    path: str | pathlib.Path,
+) -> Iterator[NCEPBufrMessage]:
+    """Yield complete source-ordered BUFR messages from a local file."""
+
+    buffer = bytearray()
+    buffer_offset = 0
+    message_index = 0
+    eof = False
+
+    with pathlib.Path(path).open("rb") as stream:
+        while True:
+            marker = buffer.find(b"BUFR")
+            if marker < 0:
+                if eof:
+                    if not buffer or not any(buffer):
+                        return
+                    if b"BUFR".startswith(buffer):
+                        raise ValueError(
+                            f"Truncated BUFR marker at byte offset {buffer_offset}"
+                        )
+                    raise ValueError(
+                        f"Invalid trailing bytes at byte offset {buffer_offset}"
+                    )
+                keep = min(3, len(buffer))
+                discard = len(buffer) - keep
+                if discard:
+                    if any(buffer[:discard]):
+                        raise ValueError(
+                            f"Invalid bytes between BUFR messages at byte offset "
+                            f"{buffer_offset}"
+                        )
+                    del buffer[:discard]
+                    buffer_offset += discard
+                chunk = stream.read(_NCEP_BUFR_READ_SIZE)
+                if chunk:
+                    buffer.extend(chunk)
+                else:
+                    eof = True
+                continue
+
+            if marker:
+                if any(buffer[:marker]):
+                    raise ValueError(
+                        f"Invalid bytes between BUFR messages at byte offset "
+                        f"{buffer_offset}"
+                    )
+                del buffer[:marker]
+                buffer_offset += marker
+
+            while len(buffer) < 8 and not eof:
+                chunk = stream.read(_NCEP_BUFR_READ_SIZE)
+                if chunk:
+                    buffer.extend(chunk)
+                else:
+                    eof = True
+            if len(buffer) < 8:
+                raise ValueError(
+                    f"Truncated BUFR section 0 at byte offset {buffer_offset}"
+                )
+
+            message_length = int.from_bytes(buffer[4:7], "big")
+            if message_length < 12 or message_length > _MAX_NCEP_BUFR_MESSAGE_SIZE:
+                raise ValueError(
+                    f"Invalid BUFR message length {message_length} at byte offset "
+                    f"{buffer_offset}"
+                )
+
+            while len(buffer) < message_length and not eof:
+                chunk = stream.read(_NCEP_BUFR_READ_SIZE)
+                if chunk:
+                    buffer.extend(chunk)
+                else:
+                    eof = True
+            if len(buffer) < message_length:
+                raise ValueError(
+                    f"Truncated BUFR message at byte offset {buffer_offset}: "
+                    f"expected {message_length} bytes, found {len(buffer)}"
+                )
+            if buffer[message_length - 4 : message_length] != b"7777":
+                raise ValueError(
+                    f"Invalid BUFR terminator at byte offset {buffer_offset}"
+                )
+
+            data = bytes(buffer[:message_length])
+            category = data[16] if len(data) > 16 else 0
+            yield NCEPBufrMessage(
+                index=message_index,
+                byte_offset=buffer_offset,
+                category=category,
+                data=data,
+            )
+            del buffer[:message_length]
+            buffer_offset += message_length
+            message_index += 1
 
 
 # ─────────────────────────────────────────────────────────────────────

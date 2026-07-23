@@ -22,6 +22,7 @@ from earth2studio.data.utils import _sync_async, prep_data_inputs
 from earth2studio.data.utils_bufr import (
     get_worker_decoder,
     init_decode_worker,
+    iter_ncep_bufr_messages,
     parse_prepbufr_messages,
     silence_bufr_noise,
 )
@@ -300,8 +301,9 @@ _NCEP_SATELLITE_NAME_BY_SAID: dict[int, str] = {
     224: "npp",
     225: "n20",
     226: "n21",
+    784: "aqua",
 }
-_NCEP_MICROWAVE_SATELLITES = frozenset(_NCEP_SATELLITE_NAME_BY_SAID.values())
+_NCEP_SATELLITES = frozenset(_NCEP_SATELLITE_NAME_BY_SAID.values())
 
 # BUFR descriptors used by the NCEP aggregate microwave templates.
 _SAID = 1007
@@ -383,7 +385,7 @@ class _NCEPMicrowaveDecodeError(RuntimeError):
         super().__init__(f"Incomplete microwave BUFR decode: {self.context}")
 
 
-_NCEP_MICROWAVE_OUTPUT_SCHEMA = pa.schema(
+_NCEP_SATELLITE_OUTPUT_SCHEMA = pa.schema(
     [
         E2STUDIO_SCHEMA.field("time"),
         E2STUDIO_SCHEMA.field("class"),
@@ -394,7 +396,7 @@ _NCEP_MICROWAVE_OUTPUT_SCHEMA = pa.schema(
         pa.field(
             "scan_position",
             pa.uint16(),
-            metadata={"description": "Encoded one-based field-of-view number"},
+            metadata={"description": "One-based cross-track position used by NCEP"},
         ),
         pa.field("scan_line", pa.uint32(), nullable=True),
         E2STUDIO_SCHEMA.field("sensor_index"),
@@ -478,6 +480,7 @@ def _decode_microwave_subset(
     datetime_min: datetime,
     datetime_max: datetime,
     satellites: frozenset[str] | None,
+    requested_channels: frozenset[int] | None,
 ) -> list[dict[str, Any]]:
     """Decode one aggregate microwave subset directly to long rows."""
     scalars: dict[int, Any] = {}
@@ -554,6 +557,8 @@ def _decode_microwave_subset(
     rows: list[dict[str, Any]] = []
     # Dict insertion order is the encoded CHNM order.
     for channel_number in channels:
+        if requested_channels is not None and channel_number not in requested_channels:
+            continue
         channel = channels[channel_number]
         frequency = _as_float(channel.get(_CHANNEL_FREQUENCY))
         channel_values = {
@@ -584,12 +589,22 @@ def _decode_message_batch(
         datetime,
         datetime,
         tuple[str, ...] | None,
+        tuple[int, ...] | None,
     ],
 ) -> tuple[list[dict[str, Any]], int]:
-    sensor, messages, variable_fields, datetime_min, datetime_max, satellite_names = (
-        arguments
-    )
+    (
+        sensor,
+        messages,
+        variable_fields,
+        datetime_min,
+        datetime_max,
+        satellite_names,
+        channel_numbers,
+    ) = arguments
     satellites = frozenset(satellite_names) if satellite_names is not None else None
+    requested_channels = (
+        frozenset(channel_numbers) if channel_numbers is not None else None
+    )
     decoder = get_worker_decoder()
     if decoder is None:
         raise RuntimeError("BUFR decoder worker is not initialized")
@@ -617,13 +632,14 @@ def _decode_message_batch(
                         datetime_min,
                         datetime_max,
                         satellites,
+                        requested_channels,
                     )
                 )
     return rows, failures
 
 
 def _rows_to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    table = pa.Table.from_pylist(rows, schema=_NCEP_MICROWAVE_OUTPUT_SCHEMA)
+    table = pa.Table.from_pylist(rows, schema=_NCEP_SATELLITE_OUTPUT_SCHEMA)
 
     def types_mapper(data_type: pa.DataType) -> pd.ArrowDtype | None:
         if pa.types.is_unsigned_integer(data_type):
@@ -647,6 +663,7 @@ class _NCEPMicrowaveAdapter:
         datetime_min: datetime,
         datetime_max: datetime,
         satellites: tuple[str, ...] | None = None,
+        requested_channels: tuple[int, ...] | None = None,
     ) -> pd.DataFrame:
         """Decode one local NCEP aggregate microwave BUFR file."""
         variable_fields = tuple(
@@ -670,6 +687,7 @@ class _NCEPMicrowaveAdapter:
                 datetime_min,
                 datetime_max,
                 satellites,
+                requested_channels,
             )
             for batch in batches
         ]
@@ -699,6 +717,601 @@ class _NCEPMicrowaveAdapter:
 
         if failures:
             raise _NCEPMicrowaveDecodeError(path, failures, len(messages))
+        logger.debug(
+            f"Decoded {len(rows):,} {sensor} channel rows in "
+            f"{time.perf_counter() - started:.1f}s"
+        )
+        return _rows_to_dataframe(rows)
+
+
+# NCEP aggregate infrared BUFR decoding.
+_IR_PROFILE_QUALITY = 33060
+_IR_DELAYED_REPLICATION_16 = 31002
+_IR_SCALED_RADIANCE = 14046
+_IR_SPECTRAL_RADIANCE = 14044
+_IR_START_CHANNEL = 25140
+_IR_END_CHANNEL = 25141
+_IR_CHANNEL_SCALE_FACTOR = 25142
+_IR_FIELD_OF_REGARD = 5045
+_IR_AIRS_LOG_WAVENUMBER = 25076
+_IR_AIRS_ACQUISITION_QUALITY = 33032
+
+# CRTM 2.4 constants used by the NCEP replay that produced the reference
+# diagnostics. IASI and CrIS spectral coefficients have identity band terms.
+_CRTM_PLANCK_C1 = 1.1910427225432485e-5
+_CRTM_PLANCK_C2 = 1.438775246065196
+
+_IR_SOURCE_FIELDS = {
+    "iasi": "SCRA",
+    "crisfsr": "SRAD",
+    "airs": "TMBR",
+}
+
+_IR_COMMON_SCALARS = {
+    _SAID,
+    _YEAR,
+    _MONTH,
+    _DAY,
+    _HOUR,
+    _MINUTE,
+    _SECOND,
+    _LAT_HIGH,
+    _LON_HIGH,
+    _SATELLITE_ZENITH,
+    _SOLAR_ZENITH,
+    _BEARING_OR_AZIMUTH,
+    _SOLAR_AZIMUTH,
+    _FOV_NUMBER,
+    _SCAN_LINE,
+}
+
+_CRIS_NUM_FOR = 30
+_CRIS_NUM_FOV = 9
+_CRIS_SCAN_START_DEG = -48.330
+_CRIS_SCAN_STEP_DEG = 3.3331
+_CRIS_FOV_DISTANCE_RAD = np.asarray(
+    [
+        2.71510e-2,
+        1.91986e-2,
+        2.71510e-2,
+        1.91986e-2,
+        0.0,
+        1.91986e-2,
+        2.71510e-2,
+        1.91986e-2,
+        2.71510e-2,
+    ],
+    dtype=np.float64,
+)
+_CRIS_FOV_DIRECTION_RAD = np.asarray(
+    [4.77057, 3.98517, 3.19977, 5.55597, 0.0, 2.41437, 0.05818, 0.84358, 1.62897],
+    dtype=np.float64,
+)
+
+# NCEP/GSI's product-specific remapping and detector geometry:
+# IASI: read_iasi.f90 lines 512--519 and 638--643.
+# CrIS: read_cris.f90 lines 210--223 and 670--674.
+# AIRS: radinfo.f90 satstep defaults.
+# https://github.com/NOAA-EMC/GSI/tree/860d13740352004fca0136a8c3d0ac9dea30e0da/src/gsi
+
+
+class _NCEPInfraredDecodeError(RuntimeError):
+    def __init__(self, path: str, failed_messages: int, total_messages: int) -> None:
+        self.context: dict[str, object] = {
+            "path": path,
+            "decoded_messages": total_messages - failed_messages,
+            "failed_messages": failed_messages,
+            "total_messages": total_messages,
+        }
+        super().__init__(f"Incomplete infrared BUFR decode: {self.context}")
+
+
+def _nominal_iasi_scan_angle(field_of_view: int) -> float:
+    scan_position = (field_of_view - 1) // 2 + 1
+    parity_adjustment = 0.625 if scan_position % 2 else -0.625
+    return -48.330 + ((field_of_view - 1) // 4) * 3.334 + parity_adjustment
+
+
+def _nominal_cris_scan_angle(field_of_regard: int, field_of_view: int) -> float:
+    """Return the signed CrIS detector look angle in degrees."""
+    if not 1 <= field_of_regard <= _CRIS_NUM_FOR:
+        raise ValueError("CrIS field of regard must be in the range 1--30")
+    if not 1 <= field_of_view <= _CRIS_NUM_FOV:
+        raise ValueError("CrIS field of view must be in the range 1--9")
+
+    for_offset = field_of_regard - 1
+    fov_offset = field_of_view - 1
+    for_rotation = np.deg2rad(for_offset * _CRIS_SCAN_STEP_DEG)
+    angle = np.deg2rad(_CRIS_SCAN_START_DEG) + for_rotation
+    angle += _CRIS_FOV_DISTANCE_RAD[fov_offset] * np.sin(
+        _CRIS_FOV_DIRECTION_RAD[fov_offset] - for_rotation
+    )
+    return float(np.rad2deg(angle))
+
+
+def _cris_wavenumber(channel: np.ndarray) -> np.ndarray:
+    """Return the fixed CrIS-FSR science-channel grid in inverse centimeters."""
+    values = np.asarray(channel, dtype=np.int64)
+    if np.any((values < 1) | (values > 2211)):
+        raise ValueError("CrIS-FSR channel numbers must be in the range 1--2211")
+    result = np.empty(values.shape, dtype=np.float64)
+    longwave = values <= 713
+    midwave = (values >= 714) & (values <= 1578)
+    shortwave = values >= 1579
+    result[longwave] = 650.0 + 0.625 * (values[longwave] - 1)
+    result[midwave] = 1210.0 + 0.625 * (values[midwave] - 714)
+    result[shortwave] = 2155.0 + 0.625 * (values[shortwave] - 1579)
+    return result
+
+
+def _crtm_radiance_to_bt(radiance: np.ndarray, wavenumber: np.ndarray) -> np.ndarray:
+    """Convert IR radiance using the CRTM convention of NCEP diagnostics."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        temperature = (_CRTM_PLANCK_C2 * wavenumber) / np.log1p(
+            (_CRTM_PLANCK_C1 * wavenumber**3) / radiance
+        )
+    return np.where(radiance > 0.0, temperature, np.nan)
+
+
+def _collect_scalars(
+    descriptors: Sequence[Any], values: Sequence[Any], extra: set[int]
+) -> dict[int, Any]:
+    scalars: dict[int, Any] = {}
+    expected = _IR_COMMON_SCALARS | extra
+    for descriptor, value in zip(descriptors, values):
+        descriptor_id = int(descriptor.id)
+        if descriptor_id in expected and descriptor_id not in scalars:
+            scalars[descriptor_id] = value
+    return scalars
+
+
+def _infrared_base_values(
+    scalars: Mapping[int, Any],
+    *,
+    sensor: str,
+    datetime_min: datetime,
+    datetime_max: datetime,
+    satellites: frozenset[str] | None,
+) -> dict[str, Any] | None:
+    observation_time = _observation_time(scalars)
+    satellite_id = _as_optional_int(scalars.get(_SAID))
+    field_of_view = _as_optional_int(scalars.get(_FOV_NUMBER))
+    if observation_time is None or satellite_id is None or field_of_view is None:
+        return None
+    if observation_time < np.datetime64(
+        datetime_min, "ns"
+    ) or observation_time > np.datetime64(datetime_max, "ns"):
+        return None
+
+    latitude = _as_float(scalars.get(_LAT_HIGH))
+    longitude = _as_float(scalars.get(_LON_HIGH))
+    if (
+        not np.isfinite(latitude)
+        or latitude < -90.0
+        or latitude > 90.0
+        or not np.isfinite(longitude)
+    ):
+        return None
+
+    satellite = _NCEP_SATELLITE_NAME_BY_SAID.get(
+        satellite_id, f"satellite-{satellite_id}"
+    )
+    if satellites is not None and satellite not in satellites:
+        return None
+
+    if sensor == "iasi":
+        scan_position = (field_of_view - 1) // 2 + 1
+        scan_angle = _nominal_iasi_scan_angle(field_of_view)
+        # C0616 SELV is spacecraft altitude, not surface elevation.
+        elevation = np.nan
+    elif sensor == "crisfsr":
+        field_of_regard = _as_optional_int(scalars.get(_IR_FIELD_OF_REGARD))
+        if field_of_regard is None:
+            return None
+        scan_position = field_of_regard
+        scan_angle = _nominal_cris_scan_angle(field_of_regard, field_of_view)
+        elevation = _as_float(scalars.get(_SURFACE_ELEVATION))
+    elif sensor == "airs":
+        scan_position = field_of_view
+        scan_angle = -48.9 + (field_of_view - 1) * 1.1
+        elevation = np.nan
+    else:  # pragma: no cover - adapter validates the sensor
+        raise ValueError(f"Unsupported NCEP infrared sensor: {sensor}")
+
+    return {
+        "time": observation_time,
+        "class": "rad",
+        "lat": latitude,
+        "lon": longitude % 360.0,
+        "elev": elevation,
+        "scan_angle": scan_angle,
+        "scan_position": scan_position,
+        "scan_line": _as_optional_int(scalars.get(_SCAN_LINE)),
+        "solza": _as_float(scalars.get(_SOLAR_ZENITH)),
+        "solaza": _as_float(scalars.get(_SOLAR_AZIMUTH)),
+        "satellite_za": _as_float(scalars.get(_SATELLITE_ZENITH)),
+        "satellite_aza": _as_float(scalars.get(_BEARING_OR_AZIMUTH)),
+        "satellite": satellite,
+    }
+
+
+def _requested_channel_order(
+    source_order: list[int], requested_channels: tuple[int, ...] | None
+) -> list[int]:
+    if requested_channels is None:
+        return source_order
+    source_channels = set(source_order)
+    missing = [
+        channel for channel in requested_channels if channel not in source_channels
+    ]
+    if missing:
+        missing_text = ", ".join(str(channel) for channel in missing)
+        raise ValueError(
+            f"Requested channels are absent from the source: {missing_text}"
+        )
+    return list(requested_channels)
+
+
+def _decode_iasi_channels(
+    descriptors: Sequence[Any],
+    values: Sequence[Any],
+    requested_channels: tuple[int, ...] | None,
+) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
+    starts: list[int | None] = []
+    ends: list[int | None] = []
+    exponents: list[int | None] = []
+    source_order: list[int] = []
+    encoded_radiance: dict[int, float] = {}
+    pending_channel: int | None = None
+
+    for descriptor, value in zip(descriptors, values):
+        descriptor_id = int(descriptor.id)
+        if descriptor_id == _IR_START_CHANNEL and len(starts) < 10:
+            starts.append(_as_optional_int(value))
+        elif descriptor_id == _IR_END_CHANNEL and len(ends) < 10:
+            ends.append(_as_optional_int(value))
+        elif descriptor_id == _IR_CHANNEL_SCALE_FACTOR and len(exponents) < 10:
+            # Compressed messages can carry null entries in individual scale
+            # groups. Keep all ten positions so later bands are not shifted.
+            exponents.append(_as_optional_int(value))
+        elif descriptor_id == _CHANNEL_NUMBER:
+            pending_channel = _as_optional_int(value)
+        elif descriptor_id == _IR_SCALED_RADIANCE and pending_channel is not None:
+            if pending_channel in encoded_radiance:
+                raise ValueError(f"IASI contains duplicate channel {pending_channel}")
+            source_order.append(pending_channel)
+            encoded_radiance[pending_channel] = _as_float(value)
+            pending_channel = None
+
+    scale_groups = list(zip(starts, ends, exponents))
+    if (
+        len(scale_groups) != 10
+        or any(start is None or end is None for start, end, _ in scale_groups)
+        or len(source_order) != 616
+    ):
+        raise ValueError("IASI scale groups or 616-channel sequence is incomplete")
+    retained = _requested_channel_order(source_order, requested_channels)
+
+    radiance: np.ndarray = np.full(len(retained), np.nan, dtype=np.float64)
+    for index, channel in enumerate(retained):
+        for start, end, exponent in scale_groups:
+            if start is not None and end is not None and start <= channel <= end:
+                if exponent is None:
+                    break
+                radiance[index] = encoded_radiance[channel] * 10.0 ** (5 - exponent)
+                break
+    channels = np.asarray(retained, dtype=np.int64)
+    wavenumber = 645.0 + 0.25 * (channels - 1)
+    temperature = _crtm_radiance_to_bt(radiance, wavenumber)
+    return channels, temperature, [None] * len(retained)
+
+
+def _extract_replicated_channels(
+    descriptors: Sequence[Any],
+    values: Sequence[Any],
+    pattern: tuple[int, ...],
+    requested_channels: tuple[int, ...] | None,
+) -> tuple[list[int], dict[int, tuple[Any, ...]]]:
+    descriptor_ids = [int(descriptor.id) for descriptor in descriptors]
+    for index, descriptor_id in enumerate(descriptor_ids):
+        if descriptor_id != _IR_DELAYED_REPLICATION_16:
+            continue
+        count = _as_optional_int(values[index])
+        if count is None or count <= 0:
+            continue
+        stop = index + 1 + len(pattern) * count
+        if stop > len(descriptor_ids):
+            continue
+        repeated_ids = descriptor_ids[index + 1 : stop]
+        if any(
+            tuple(repeated_ids[offset : offset + len(pattern)]) != pattern
+            for offset in range(0, len(repeated_ids), len(pattern))
+        ):
+            continue
+
+        source_order: list[int] = []
+        source: dict[int, tuple[Any, ...]] = {}
+        for offset in range(index + 1, stop, len(pattern)):
+            channel = _as_optional_int(values[offset])
+            if channel is None or channel in source:
+                raise ValueError(
+                    "Infrared source contains a missing or duplicate channel"
+                )
+            source_order.append(channel)
+            source[channel] = tuple(values[offset + 1 : offset + len(pattern)])
+        retained = _requested_channel_order(source_order, requested_channels)
+        return retained, source
+    raise ValueError("Expected infrared delayed-replication sequence was not found")
+
+
+def _decode_cris_channels(
+    descriptors: Sequence[Any],
+    values: Sequence[Any],
+    requested_channels: tuple[int, ...] | None,
+) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
+    retained, source = _extract_replicated_channels(
+        descriptors,
+        values,
+        (_CHANNEL_NUMBER, _IR_SPECTRAL_RADIANCE),
+        requested_channels,
+    )
+    channels = np.asarray(retained, dtype=np.int64)
+    wavenumber = _cris_wavenumber(channels)
+    radiance_mw = np.asarray(
+        [_as_float(source[channel][0]) * 1000.0 for channel in retained],
+        dtype=np.float64,
+    )
+    temperature = _crtm_radiance_to_bt(radiance_mw, wavenumber)
+    return channels, temperature, [None] * len(retained)
+
+
+def _decode_airs_channels(
+    descriptors: Sequence[Any],
+    values: Sequence[Any],
+    requested_channels: tuple[int, ...] | None,
+) -> tuple[np.ndarray, np.ndarray, list[int | None], np.ndarray]:
+    retained, source = _extract_replicated_channels(
+        descriptors,
+        values,
+        (
+            _CHANNEL_NUMBER,
+            _IR_AIRS_LOG_WAVENUMBER,
+            _IR_AIRS_ACQUISITION_QUALITY,
+            _BRIGHTNESS_TEMPERATURE,
+        ),
+        requested_channels,
+    )
+    channels = np.asarray(retained, dtype=np.int64)
+    wavenumber = np.asarray(
+        [10.0 ** _as_float(source[channel][0]) / 100.0 for channel in retained],
+        dtype=np.float64,
+    )
+    temperature = np.asarray(
+        [_as_float(source[channel][2]) for channel in retained], dtype=np.float64
+    )
+    quality = [_as_optional_int(source[channel][1]) for channel in retained]
+    return channels, temperature, quality, wavenumber
+
+
+def _decode_infrared_subset(
+    descriptors: Sequence[Any],
+    values: Sequence[Any],
+    sensor: str,
+    variable: str,
+    requested_channels: tuple[int, ...] | None,
+    datetime_min: datetime,
+    datetime_max: datetime,
+    satellites: frozenset[str] | None,
+) -> list[dict[str, Any]]:
+    extra_scalars = {
+        "iasi": {_IR_PROFILE_QUALITY},
+        "crisfsr": {_IR_FIELD_OF_REGARD, _SURFACE_ELEVATION},
+        "airs": set(),
+    }[sensor]
+    scalars = _collect_scalars(descriptors, values, extra_scalars)
+    base = _infrared_base_values(
+        scalars,
+        sensor=sensor,
+        datetime_min=datetime_min,
+        datetime_max=datetime_max,
+        satellites=satellites,
+    )
+    if base is None:
+        return []
+
+    if sensor == "iasi":
+        channels, observation, quality = _decode_iasi_channels(
+            descriptors, values, requested_channels
+        )
+        wavenumber = 645.0 + 0.25 * (channels - 1)
+        profile_quality = _as_optional_int(scalars.get(_IR_PROFILE_QUALITY))
+        quality = [profile_quality] * len(channels)
+    elif sensor == "crisfsr":
+        channels, observation, quality = _decode_cris_channels(
+            descriptors, values, requested_channels
+        )
+        wavenumber = _cris_wavenumber(channels)
+    else:
+        channels, observation, quality, wavenumber = _decode_airs_channels(
+            descriptors, values, requested_channels
+        )
+
+    rows: list[dict[str, Any]] = []
+    for channel, channel_wavenumber, channel_quality, channel_observation in zip(
+        channels, wavenumber, quality, observation
+    ):
+        if not np.isfinite(channel_observation):
+            continue
+        rows.append(
+            {
+                **base,
+                "sensor_index": int(channel),
+                "wavenumber": float(channel_wavenumber),
+                "quality": channel_quality,
+                "observation": float(channel_observation),
+                "variable": variable,
+            }
+        )
+    return rows
+
+
+def _decode_infrared_message(
+    arguments: tuple[
+        str,
+        str,
+        bytes,
+        tuple[int, ...] | None,
+        datetime,
+        datetime,
+        tuple[str, ...] | None,
+    ],
+) -> tuple[list[dict[str, Any]], int]:
+    (
+        sensor,
+        variable,
+        message_bytes,
+        requested_channels,
+        datetime_min,
+        datetime_max,
+        satellite_names,
+    ) = arguments
+    satellites = frozenset(satellite_names) if satellite_names is not None else None
+    decoder = get_worker_decoder()
+    if decoder is None:
+        raise RuntimeError("BUFR decoder worker is not initialized")
+
+    try:
+        with silence_bufr_noise():
+            message = decoder.process(message_bytes)
+        template_data = message.template_data.value
+        descriptors_all = template_data.decoded_descriptors_all_subsets
+        values_all = template_data.decoded_values_all_subsets
+        rows: list[dict[str, Any]] = []
+        for descriptors, values in zip(descriptors_all, values_all):
+            rows.extend(
+                _decode_infrared_subset(
+                    descriptors,
+                    values,
+                    sensor,
+                    variable,
+                    requested_channels,
+                    datetime_min,
+                    datetime_max,
+                    satellites,
+                )
+            )
+        return rows, 0
+    except Exception:
+        return [], 1
+
+
+class _NCEPInfraredAdapter:
+    """Decode NCEP aggregate infrared BUFR independently of its transport."""
+
+    def __init__(self, decode_workers: int = 8) -> None:
+        self.decode_workers = max(1, decode_workers)
+
+    def decode_file(
+        self,
+        path: str,
+        sensor: str,
+        plan: Mapping[str, str],
+        datetime_min: datetime,
+        datetime_max: datetime,
+        satellites: tuple[str, ...] | None = None,
+        requested_channels: tuple[int, ...] | None = None,
+    ) -> pd.DataFrame:
+        """Decode one local NCEP aggregate infrared BUFR file."""
+        if sensor not in _IR_SOURCE_FIELDS:
+            raise ValueError(f"Unsupported NCEP infrared sensor: {sensor}")
+        if len(plan) != 1:
+            raise ValueError(f"{sensor} requires exactly one output variable")
+        variable, source_field = next(iter(plan.items()))
+        if source_field != _IR_SOURCE_FIELDS[sensor]:
+            raise ValueError(f"Unsupported {sensor} source field: {source_field}")
+
+        dx_messages: list[bytes] = []
+        page: list[bytes] = []
+        rows: list[dict[str, Any]] = []
+        failures = 0
+        total_messages = 0
+        executor: ProcessPoolExecutor | None = None
+        initialized = False
+        page_size = max(8, 4 * self.decode_workers)
+        started = time.perf_counter()
+
+        def initialize() -> None:
+            nonlocal executor, initialized
+            if initialized:
+                return
+            table_b, table_d, _ = parse_prepbufr_messages(b"".join(dx_messages))
+            if not table_b or not table_d:
+                raise ValueError(f"Embedded NCEP BUFR tables are missing from {path}")
+            if self.decode_workers > 1:
+                executor = ProcessPoolExecutor(
+                    max_workers=self.decode_workers,
+                    initializer=init_decode_worker,
+                    initargs=(table_b, table_d),
+                )
+            else:
+                init_decode_worker(table_b, table_d)
+            initialized = True
+
+        def decode_page() -> None:
+            nonlocal failures
+            if not page:
+                return
+            arguments = [
+                (
+                    sensor,
+                    variable,
+                    message_bytes,
+                    requested_channels,
+                    datetime_min,
+                    datetime_max,
+                    satellites,
+                )
+                for message_bytes in page
+            ]
+            results = (
+                executor.map(_decode_infrared_message, arguments, chunksize=1)
+                if executor is not None
+                else map(_decode_infrared_message, arguments)
+            )
+            for message_rows, message_failures in results:
+                rows.extend(message_rows)
+                failures += message_failures
+            page.clear()
+
+        try:
+            for message in iter_ncep_bufr_messages(path):
+                if message.category == 11:
+                    if initialized:
+                        raise ValueError(
+                            "DX table message appeared after infrared data"
+                        )
+                    dx_messages.append(message.data)
+                    continue
+                initialize()
+                # C0431 ends with two 54-byte category-21 control messages
+                # containing no observation subsets.
+                if sensor == "crisfsr" and message.category == 21:
+                    continue
+                page.append(message.data)
+                total_messages += 1
+                if len(page) >= page_size:
+                    decode_page()
+            if not initialized:
+                raise ValueError(f"No infrared data messages were found in {path}")
+            decode_page()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+
+        if failures:
+            raise _NCEPInfraredDecodeError(path, failures, total_messages)
+        if total_messages == 0:
+            raise ValueError(f"No {sensor} data messages were decoded from {path}")
         logger.debug(
             f"Decoded {len(rows):,} {sensor} channel rows in "
             f"{time.perf_counter() - started:.1f}s"

@@ -72,6 +72,9 @@ def test_nnja_obs_sat_lexicon_routes_and_quantity_identity():
         "mhs": "mhs::TMBR",
         "amsua": "amsua::TMBR",
         "amsub": "amsub::TMBR",
+        "iasi": "iasi::SCRA",
+        "crisfsr": "crisfsr::SRAD",
+        "airs": "airs::TMBR",
     }
 
     frame = pd.DataFrame({"observation": [201.25]})
@@ -81,4 +84,4 @@ def test_nnja_obs_sat_lexicon_routes_and_quantity_identity():
         assert modifier(frame) is frame
 
     with pytest.raises(KeyError):
-        NNJAObsSatLexicon["crisfsr"]
+        NNJAObsSatLexicon["unknown"]
