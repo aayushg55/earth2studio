@@ -109,7 +109,7 @@ _TEST_DEPENDENCIES: dict[str, list[str]] = {
     ],
     # Model da tests
     "test/models/da/test_da_healda.py": ["da-healda"],
-    "test/models/da/test_da_healda_v2.py": ["da-healda"],
+    "test/models/da/test_da_healda_v2.py": ["da-healda-v2"],
     "test/models/da/test_da_interp.py": ["da-interp"],
     "test/models/da/test_da_sda_stormcast.py": ["da-stormcast"],
     # Serve tests
@@ -193,7 +193,6 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-
     # Skip tests whose optional dependency groups are missing.
     # pytest_ignore_collect handles directory traversal, this is for when individual
     # files are targeted when testing

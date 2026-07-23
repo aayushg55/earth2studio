@@ -24,8 +24,13 @@ import xarray as xr
 
 from earth2studio.models.da.healda import E2S_CHANNELS
 from earth2studio.models.da.healda_v2 import (
+    IR_PCA_SENSORS,
+    MW_SENSORS,
     N_WINDOW,
     HealDAv2,
+    _choose_model_parallel_size,
+    _ContextParallelRotaryEmbedding,
+    _random_benchmark_assets,
 )
 from earth2studio.models.da.healda_v2_utils import (
     CONV_PLEVEL_SURFACE_EXPANDED_CHANNEL,
@@ -66,13 +71,13 @@ T_600_STD = 10.0
 
 
 class PhooVideoHealDAModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, time_length=N_WINDOW):
         super().__init__()
         self.in_channels = 2
         self.out_channels = NVAR
         self.npix = NPIX_OUT
         self.level_model = LEVEL_MODEL
-        self.time_length = N_WINDOW
+        self.time_length = time_length
         self.last_call: dict = {}
 
     def forward(self, x, t, second_of_day, day_of_year, obs_ctx, class_labels=None):
@@ -167,20 +172,29 @@ def _build_codec() -> PCACodec:
     )
 
 
-def _build_model(device="cpu", lat_lon=False):
+def _build_model(
+    device="cpu",
+    lat_lon=False,
+    model_parallel_size=1,
+    model_parallel_rank=0,
+    model_parallel_group=None,
+):
     with patch("earth2studio.models.da.healda_v2.earth2grid") as mock_e2g:
         mock_e2g.healpix.Grid.return_value = MockGrid()
         mock_e2g.healpix.HEALPIX_PAD_XY = 0
         if lat_lon:
             mock_e2g.get_regridder.return_value = MockRegridder(NLAT, NLON)
         model = HealDAv2(
-            model=PhooVideoHealDAModel(),
+            model=PhooVideoHealDAModel(N_WINDOW // model_parallel_size),
             condition=torch.zeros(1, 2, 1, NPIX_OUT),
             era5_mean=torch.zeros(1, NVAR, 1, 1),
             era5_std=torch.ones(1, NVAR, 1, 1),
             channel_stats=_build_channel_stats(),
             raw_to_local={"atms": build_raw_to_local_lut(np.arange(1, 23))},
             codecs={"airs-pca": _build_codec()},
+            model_parallel_size=model_parallel_size,
+            model_parallel_rank=model_parallel_rank,
+            model_parallel_group=model_parallel_group,
             lat_lon=lat_lon,
             output_resolution=(NLAT, NLON),
         )
@@ -239,10 +253,54 @@ def _build_raw_sat_df(n_obs=10, request_time=None, sensor="atms", satellite="n20
 
 
 def _mock_forward(inputs):
-    return torch.zeros(1, NVAR, N_WINDOW, NPIX_OUT)
+    return torch.zeros(1, NVAR, NPIX_OUT)
 
 
 # ---------- Utils tests ----------
+
+
+@pytest.mark.parametrize(
+    "world_size, requested, expected",
+    [(1, None, 1), (8, None, 8), (8, 1, 1), (8, 2, 2), (8, 4, 4)],
+)
+def test_choose_model_parallel_size(world_size, requested, expected):
+    assert _choose_model_parallel_size(world_size, requested) == expected
+
+
+@pytest.mark.parametrize(
+    "world_size, requested",
+    [(3, None), (4, 3), (2, 4)],
+)
+def test_choose_model_parallel_size_invalid(world_size, requested):
+    with pytest.raises(ValueError, match="model_parallel_size"):
+        _choose_model_parallel_size(world_size, requested)
+
+
+def test_context_parallel_rotary_embedding_uses_global_length():
+    class RotaryEmbedding(torch.nn.Module):
+        def forward(self, seq_len):
+            return torch.zeros(seq_len, 4), torch.ones(seq_len, 4)
+
+    rotary_embedding = _ContextParallelRotaryEmbedding(RotaryEmbedding(), 4)
+    cos, sin = rotary_embedding(2)
+
+    assert cos.shape == (N_WINDOW, 4)
+    assert sin.shape == (N_WINDOW, 4)
+
+
+def test_random_benchmark_assets():
+    condition, mean, std, stats, raw_to_local, codecs = _random_benchmark_assets(
+        torch.device("cpu"),
+        NPIX_OUT,
+    )
+
+    assert condition.shape == (1, 2, 1, NPIX_OUT)
+    assert mean.shape == (1, NVAR, 1, 1)
+    assert std.shape == (1, NVAR, 1, 1)
+    assert np.all(stats["mean"] == 0)
+    assert np.all(stats["stddev"] == 1)
+    assert set(raw_to_local) == set(MW_SENSORS)
+    assert set(codecs) == set(IR_PCA_SENSORS)
 
 
 def test_nearest_pressure_level_index():
@@ -464,6 +522,26 @@ def test_frame_bucketing():
     assert target[0] == int(frame3_valid.timestamp())
 
 
+@pytest.mark.parametrize(
+    "rank, expected",
+    [
+        (0, (-45, -33)),
+        (1, (-33, -21)),
+        (2, (-21, -9)),
+        (3, (-9, 3)),
+    ],
+)
+def test_model_parallel_input_time_tolerance(rank, expected):
+    model = _build_model(
+        model_parallel_size=4,
+        model_parallel_rank=rank,
+        model_parallel_group=object(),
+    )
+
+    tolerance = model.input_time_tolerance(REQUEST_TIME[0])
+    assert tolerance == tuple(np.timedelta64(hours, "h") for hours in expected)
+
+
 # ---------- build_input / call tests ----------
 
 
@@ -483,6 +561,60 @@ def test_build_input_obs_ctx():
     assert inputs["second_of_day"].shape == (1, N_WINDOW)
     assert inputs["day_of_year"].shape == (1, N_WINDOW)
     assert inputs["condition"].shape == (1, 2, N_WINDOW, NPIX_OUT)
+
+
+def test_model_parallel_frame_assignment_and_broadcast():
+    group = object()
+    model = _build_model(
+        model_parallel_size=2,
+        model_parallel_rank=1,
+        model_parallel_group=group,
+    )
+    frame_times = model._frame_valid_times(REQUEST_TIME[0])
+    assert frame_times == [
+        pd.Timestamp(REQUEST_TIME[0]) - pd.Timedelta(hours=18),
+        pd.Timestamp(REQUEST_TIME[0]) - pd.Timedelta(hours=12),
+        pd.Timestamp(REQUEST_TIME[0]) - pd.Timedelta(hours=6),
+        pd.Timestamp(REQUEST_TIME[0]),
+    ]
+
+    conv_df = _build_raw_conv_df(4)
+
+    with (
+        patch("torch.distributed.all_reduce"),
+        patch("torch.distributed.get_global_rank", return_value=1),
+        patch("torch.distributed.broadcast") as broadcast,
+    ):
+        out = model(conv_df, analysis_time=REQUEST_TIME[0])
+
+    assert out.shape == (1, NVAR, NPIX_OUT)
+    np.testing.assert_allclose(out.values, 0.0)
+    broadcast.assert_called_once()
+
+
+def test_model_parallel_broadcast_buffer_is_contiguous():
+    model = _build_model(
+        model_parallel_size=2,
+        model_parallel_rank=0,
+        model_parallel_group=object(),
+    )
+    conv_df = _build_raw_conv_df(4)
+
+    def mark_remote_observations(count, group):
+        count.fill_(1)
+
+    def broadcast(analysis, src, group):
+        assert analysis.is_contiguous()
+        analysis.fill_(2)
+
+    with (
+        patch("torch.distributed.all_reduce", side_effect=mark_remote_observations),
+        patch("torch.distributed.get_global_rank", return_value=1),
+        patch("torch.distributed.broadcast", side_effect=broadcast),
+    ):
+        out = model(conv_df, analysis_time=REQUEST_TIME[0])
+
+    np.testing.assert_allclose(out.values, 2.0)
 
 
 @pytest.mark.parametrize(
@@ -507,17 +639,12 @@ def test_healda_v2_call(device, lat_lon):
 
     assert isinstance(out, xr.DataArray)
     if lat_lon:
-        assert out.dims == ("time", "lead_time", "variable", "lat", "lon")
-        assert out.shape == (1, N_WINDOW, NVAR, NLAT, NLON)
+        assert out.dims == ("time", "variable", "lat", "lon")
+        assert out.shape == (1, NVAR, NLAT, NLON)
     else:
-        assert out.dims == ("time", "lead_time", "variable", "npix")
-        assert out.shape == (1, N_WINDOW, NVAR, NPIX_OUT)
+        assert out.dims == ("time", "variable", "npix")
+        assert out.shape == (1, NVAR, NPIX_OUT)
     assert np.all(out.coords["time"].values == REQUEST_TIME)
-    # Analysis frame is the final lead_time == 0
-    assert out.coords["lead_time"].values[-1] == np.timedelta64(0, "ns")
-    assert out.coords["lead_time"].values[0] == np.timedelta64(-42, "h").astype(
-        "timedelta64[ns]"
-    )
 
 
 def test_healda_v2_call_missing_request_time():
@@ -549,7 +676,7 @@ def test_healda_v2_call_empty_obs():
     df = _build_raw_conv_df(5, observation=9999.0)  # violates t valid range
     out = model(df)
     assert isinstance(out, xr.DataArray)
-    assert out.shape == (1, N_WINDOW, NVAR, NPIX_OUT)
+    assert out.shape == (1, NVAR, NPIX_OUT)
     assert np.all(np.isnan(out.values))
 
 
@@ -563,11 +690,11 @@ def test_healda_v2_generator():
 
     with patch.object(model, "_forward", _mock_forward):
         da = gen.send((conv_df, None))
-        assert da.shape == (1, N_WINDOW, NVAR, NPIX_OUT)
+        assert da.shape == (1, NVAR, NPIX_OUT)
         da = gen.send((None, sat_df))
-        assert da.shape == (1, N_WINDOW, NVAR, NPIX_OUT)
+        assert da.shape == (1, NVAR, NPIX_OUT)
         da = gen.send((conv_df, sat_df))
-        assert da.shape == (1, N_WINDOW, NVAR, NPIX_OUT)
+        assert da.shape == (1, NVAR, NPIX_OUT)
 
     with pytest.raises(ValueError, match="At least one"):
         gen.send((None, None))
@@ -597,8 +724,7 @@ def test_healda_v2_input_coords():
 def test_healda_v2_output_coords():
     model = _build_model()
     (coords,) = model.output_coords(model.input_coords(), request_time=REQUEST_TIME)
-    assert list(coords.keys()) == ["time", "lead_time", "variable", "npix"]
-    assert len(coords["lead_time"]) == N_WINDOW
+    assert list(coords.keys()) == ["time", "variable", "npix"]
     assert len(coords["variable"]) == NVAR
     assert len(coords["npix"]) == NPIX_OUT
 

@@ -22,11 +22,11 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as torch_dist
 import xarray as xr
 from loguru import logger
 
 from earth2studio.models.auto import AutoModelMixin, Package
-from earth2studio.models.da.base import AssimilationModel
 from earth2studio.models.da.healda import E2S_CHANNELS, ERA5_CHANNELS
 from earth2studio.models.da.healda_v2_utils import (
     CONV_CHANNELS,
@@ -38,6 +38,7 @@ from earth2studio.models.da.healda_v2_utils import (
     IR_BT_MAX_VALID,
     IR_BT_MIN_VALID,
     PLATFORM_NAME_TO_ID,
+    SENSOR_CHANNELS,
     SENSOR_OFFSET,
     PCACodec,
     QCLimits,
@@ -66,6 +67,7 @@ except ImportError:
 
 try:
     import earth2grid
+    from physicsnemo.distributed import DistributedManager
     from physicsnemo.experimental.models.healda import (
         VideoHealDA as _VideoHealDAModel,
     )
@@ -73,7 +75,8 @@ try:
         prepare_obs_context,
     )
 except ImportError:
-    OptionalDependencyFailure("da-healda")
+    OptionalDependencyFailure("da-healda-v2")
+    DistributedManager = None
     earth2grid = None
     _VideoHealDAModel = None
     prepare_obs_context = None
@@ -84,6 +87,7 @@ except ImportError:
 N_WINDOW = 8
 WINDOW_STEP_HOURS = 6
 FRAME_CONTEXT_HOURS = 3
+MODEL_PARALLEL_SIZES = (1, 2, 4, 8)
 
 # Microwave sounders consumed directly and infrared sounders consumed through
 # PCA compression. UFSObsSat variable names for the raw IR sensors differ from
@@ -127,6 +131,211 @@ _OBS_FRAME_DTYPES = {
 }
 
 
+def _choose_model_parallel_size(world_size: int, requested: int | None) -> int:
+    size = world_size if requested is None else requested
+    if size not in MODEL_PARALLEL_SIZES:
+        raise ValueError(
+            f"model_parallel_size must be one of {MODEL_PARALLEL_SIZES}; got {size}"
+        )
+    if world_size % size:
+        raise ValueError(
+            f"model_parallel_size={size} must divide world_size={world_size}"
+        )
+    return size
+
+
+def _setup_model_parallel(
+    requested: int | None,
+) -> tuple[torch.device, int, int, torch_dist.ProcessGroup | None]:
+    if DistributedManager is None:
+        raise RuntimeError("PhysicsNeMo DistributedManager is unavailable")
+    if not DistributedManager.is_initialized():
+        DistributedManager.initialize()
+
+    manager = DistributedManager()
+    size = _choose_model_parallel_size(manager.world_size, requested)
+    if size == 1:
+        return manager.device, size, 0, None
+
+    mesh_dims = {"data": manager.world_size // size, "model": size}
+    if manager.mesh_dims:
+        if manager.mesh_dims != mesh_dims:
+            raise RuntimeError(
+                f"Existing PhysicsNeMo mesh {manager.mesh_dims} does not match "
+                f"requested mesh {mesh_dims}"
+            )
+        mesh = manager.global_mesh
+    else:
+        mesh = manager.initialize_mesh(
+            mesh_shape=(mesh_dims["data"], mesh_dims["model"]),
+            mesh_dim_names=("data", "model"),
+        )
+
+    return (
+        manager.device,
+        size,
+        mesh.get_local_rank("model"),
+        mesh.get_group("model"),
+    )
+
+
+class _ContextParallelRotaryEmbedding(torch.nn.Module):
+    def __init__(self, rotary_embedding: torch.nn.Module, parallel_size: int) -> None:
+        super().__init__()
+        self.rotary_embedding = rotary_embedding
+        self.parallel_size = parallel_size
+
+    def forward(self, seq_len: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        global_seq_len = None if seq_len is None else seq_len * self.parallel_size
+        return cast(
+            tuple[torch.Tensor, torch.Tensor],
+            self.rotary_embedding(global_seq_len),
+        )
+
+
+def _enable_context_parallel(
+    model: Any,
+    group: torch_dist.ProcessGroup,
+    parallel_size: int,
+) -> None:
+    rotary_embedding = model.dit.temporal_rope
+    if rotary_embedding is not None:
+        model.dit.temporal_rope = _ContextParallelRotaryEmbedding(
+            rotary_embedding,
+            parallel_size,
+        )
+    model.set_context_parallel("all_to_all", group)
+
+
+def _random_benchmark_assets(
+    device: torch.device,
+    npix: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    pd.DataFrame,
+    dict[str, np.ndarray],
+    dict[str, PCACodec],
+]:
+    generator = torch.Generator().manual_seed(0)
+    condition = torch.randn(1, 2, 1, npix, generator=generator).to(device)
+    era5_mean = torch.zeros(1, len(ERA5_CHANNELS), 1, 1, device=device)
+    era5_std = torch.ones_like(era5_mean)
+
+    channel_count = sum(SENSOR_CHANNELS.values())
+    channel_stats = pd.DataFrame(
+        {
+            "Global_Channel_ID": np.arange(channel_count, dtype=np.int64),
+            "mean": np.zeros(channel_count, dtype=np.float32),
+            "stddev": np.ones(channel_count, dtype=np.float32),
+            "min_valid": np.full(channel_count, -np.inf, dtype=np.float32),
+            "max_valid": np.full(channel_count, np.inf, dtype=np.float32),
+        }
+    )
+    raw_to_local = {
+        sensor: build_raw_to_local_lut(
+            np.arange(1, SENSOR_CHANNELS[sensor] + 1, dtype=np.int64)
+        )
+        for sensor in MW_SENSORS
+    }
+
+    codecs = {}
+    for sensor in IR_PCA_SENSORS:
+        raw_sensor = sensor.removesuffix("-pca")
+        raw_channels = SENSOR_CHANNELS[raw_sensor]
+        latent_channels = SENSOR_CHANNELS[sensor]
+        components = torch.randn(
+            raw_channels,
+            latent_channels,
+            generator=generator,
+        ) / np.sqrt(raw_channels)
+        codec = PCACodec(
+            bt_mean=torch.zeros(raw_channels),
+            bt_std=torch.ones(raw_channels),
+            components=components,
+            channel_gcids=torch.arange(
+                SENSOR_OFFSET[raw_sensor],
+                SENSOR_OFFSET[raw_sensor] + raw_channels,
+            ),
+            sensor_chan=torch.arange(1, raw_channels + 1),
+        )
+        codecs[sensor] = codec
+
+    return condition, era5_mean, era5_std, channel_stats, raw_to_local, codecs
+
+
+def _load_package_assets(
+    package: Package,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    pd.DataFrame,
+    dict[str, np.ndarray],
+    dict[str, PCACodec],
+]:
+    condition = torch.from_numpy(
+        np.load(package.resolve("static/condition_hpx6_padxy.npy"))
+    ).to(device)
+
+    channel_table = pd.read_parquet(package.resolve("stats/channel_table.parquet"))
+    channel_stats = channel_table[
+        ["Global_Channel_ID", "mean", "stddev", "min_valid", "max_valid"]
+    ]
+    level_stats = pd.read_csv(package.resolve("stats/conv_normalizations_by_level.csv"))
+    conv_offset = SENSOR_OFFSET["conv"]
+    base_conv = channel_stats[
+        (channel_stats["Global_Channel_ID"] >= conv_offset)
+        & (channel_stats["Global_Channel_ID"] < conv_offset + len(CONV_CHANNELS))
+    ]
+    plevel_offset = SENSOR_OFFSET["conv-plevel"]
+    channel_stats = pd.concat(
+        [
+            channel_stats[channel_stats["Global_Channel_ID"] < plevel_offset],
+            build_conv_plevel_channel_stats(level_stats, base_conv),
+        ],
+        ignore_index=True,
+    )
+
+    raw_to_local = {}
+    for sensor in MW_SENSORS:
+        stats = pd.read_csv(
+            package.resolve(f"stats/normalizations/{sensor}_normalizations.csv")
+        )
+        stats = stats[stats["Platform_ID"] == -1]
+        raw_to_local[sensor] = build_raw_to_local_lut(
+            stats["Raw_Channel_ID"].to_numpy()
+        )
+
+    codecs = {
+        sensor: PCACodec.load(package.resolve(f"codecs/{sensor}.pt"))
+        for sensor in IR_PCA_SENSORS
+    }
+
+    stats = pd.read_csv(package.resolve("stats/era5_13_levels_stats.csv"))
+    level = stats["level"].astype(int)
+    channel = np.where(
+        level.eq(-1), stats["variable"], stats["variable"] + level.astype(str)
+    )
+    ordered = stats.assign(channel=channel).set_index("channel").loc[ERA5_CHANNELS]
+    era5_mean = torch.from_numpy(ordered["mean"].to_numpy(dtype=np.float32)).view(
+        1, -1, 1, 1
+    )
+    era5_std = torch.from_numpy(ordered["std"].to_numpy(dtype=np.float32)).view(
+        1, -1, 1, 1
+    )
+    return (
+        condition,
+        era5_mean.to(device),
+        era5_std.to(device),
+        channel_stats,
+        raw_to_local,
+        codecs,
+    )
+
+
 def _obs_frame(data: dict) -> pd.DataFrame:
     return pd.DataFrame(data).astype(_OBS_FRAME_DTYPES, copy=False)
 
@@ -136,12 +345,9 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     """HealDA-v2 video data assimilation model for global weather analysis from
     sparse observations on a HEALPix grid.
 
-    HealDA-v2 is a stateless assimilation model that jointly produces an
-    8-frame, 48-hour window of global weather analyses (6-hour spacing) from
-    conventional and satellite observations. The final frame, valid at the
-    request time, is the present-time analysis. Each frame ingests its own
-    ±3-hour observation context, so the full observation window spans
-    (request_time - 45h, request_time + 3h].
+    HealDA-v2 always processes an 8-frame, 48-hour window and returns the final
+    present-time analysis. One rank owns all 8 frames; multiple ranks split
+    those frames into non-overlapping contiguous subsets.
 
     Compared to v1, the model consumes infrared hyperspectral sounders (IASI,
     CrIS-FSR, AIRS) compressed to 32 PCA latents per footprint, and normalizes
@@ -176,6 +382,14 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     codecs : dict[str, PCACodec]
         PCA codecs keyed by PCA sensor name (``iasi-pca``, ``cris-fsr-pca``,
         ``airs-pca``)
+    model_parallel_size : int, optional
+        Number of ranks splitting the 8-frame time axis, by default 1
+    model_parallel_rank : int, optional
+        Rank within the model-parallel group, by default 0
+    model_parallel_group : torch.distributed.ProcessGroup | None, optional
+        Process group used for context parallelism, by default None
+    random_assets : bool, optional
+        Whether preprocessing uses generated benchmark assets, by default False
     lat_lon : bool, optional
         If True the model output is regridded from the native HEALPix grid to a
         regular equiangular lat-lon grid using ``earth2grid``. If False the raw
@@ -199,6 +413,10 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         channel_stats: pd.DataFrame,
         raw_to_local: dict[str, np.ndarray],
         codecs: dict[str, "PCACodec"],
+        model_parallel_size: int = 1,
+        model_parallel_rank: int = 0,
+        model_parallel_group: torch_dist.ProcessGroup | None = None,
+        random_assets: bool = False,
         lat_lon: bool = False,
         output_resolution: tuple[int, int] = (181, 360),
     ) -> None:
@@ -213,12 +431,34 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         ]
         self._raw_to_local = raw_to_local
         self._codecs = codecs
+        self._random_assets = random_assets
         self._lat_lon = lat_lon
         self._plevel_lut = conv_plevel_local_channel_lut()
+        if model_parallel_size not in MODEL_PARALLEL_SIZES:
+            raise ValueError(
+                "model_parallel_size must be one of "
+                f"{MODEL_PARALLEL_SIZES}; got {model_parallel_size}"
+            )
+        if not 0 <= model_parallel_rank < model_parallel_size:
+            raise ValueError(
+                f"model_parallel_rank={model_parallel_rank} is outside "
+                f"[0, {model_parallel_size})"
+            )
+        if model_parallel_size > 1 and model_parallel_group is None:
+            raise ValueError("model_parallel_group is required for multiple ranks")
+        self._model_parallel_size = model_parallel_size
+        self._model_parallel_rank = model_parallel_rank
+        self._model_parallel_group = model_parallel_group
 
         # Model geometry: observations are assigned to pixels on the backbone
         # (level_model) grid, output is on the finer level_in grid.
         self._time_length = int(model.time_length)
+        if self._time_length != self.frames_per_rank:
+            raise ValueError(
+                f"Model time_length={self._time_length} does not match "
+                f"{self.frames_per_rank} frames for model_parallel_size="
+                f"{self._model_parallel_size}"
+            )
         self._npix_out = int(model.npix)
         self._npix_model = 12 * 4 ** int(model.level_model)
         self._grid = earth2grid.healpix.Grid(
@@ -244,6 +484,21 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     @property
     def device(self) -> torch.device:
         return self.device_buffer.device
+
+    @property
+    def frames_per_rank(self) -> int:
+        """Number of contiguous video frames assigned to this rank."""
+        return N_WINDOW // self._model_parallel_size
+
+    @property
+    def model_parallel_rank(self) -> int:
+        """Rank within the model-parallel process group."""
+        return self._model_parallel_rank
+
+    @property
+    def model_parallel_size(self) -> int:
+        """Number of ranks splitting the video time axis."""
+        return self._model_parallel_size
 
     def init_coords(self) -> None:
         """Initialization coords (not required)"""
@@ -296,7 +551,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         request_time: np.ndarray | None = None,
         **kwargs: Any,
     ) -> tuple[CoordSystem]:
-        """Output coordinate system for the HealDA-v2 analysis window.
+        """Output coordinate system for the HealDA-v2 final analysis.
 
         Parameters
         ----------
@@ -308,21 +563,10 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         Returns
         -------
         tuple[CoordSystem]
-            Coordinate system with time, lead_time, variable, and lat/lon or
-            npix dimensions. The ``lead_time`` axis holds the 8 frame offsets
-            relative to the analysis time (-42h ... 0h); the analysis frame is
-            ``lead_time == 0``.
+            Coordinate system with time, variable, and lat/lon or npix dimensions.
         """
         if request_time is None:
             request_time = np.array([np.datetime64("NaT")], dtype="datetime64[ns]")
-
-        lead_time = np.array(
-            [
-                np.timedelta64(-(self._time_length - 1 - g) * WINDOW_STEP_HOURS, "h")
-                for g in range(self._time_length)
-            ],
-            dtype="timedelta64[ns]",
-        )
 
         if self._lat_lon:
             return (
@@ -330,7 +574,6 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                     OrderedDict(
                         {
                             "time": request_time,
-                            "lead_time": lead_time,
                             "variable": np.array(E2S_CHANNELS, dtype=str),
                             "lat": self._output_lat,
                             "lon": self._output_lon,
@@ -344,7 +587,6 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                 OrderedDict(
                     {
                         "time": request_time,
-                        "lead_time": lead_time,
                         "variable": np.array(E2S_CHANNELS, dtype=str),
                         "npix": np.arange(self._npix_out),
                     }
@@ -362,23 +604,23 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             The HealDA-v2 model package has not been published yet
         """
         raise NotImplementedError(
-            "The HealDA-v2 model package has not been published yet. Provide a "
-            "local or remote Package with the expected layout to load_model."
+            "The HealDA-v2 model package has not been published yet. Use "
+            "load_model() without a package for benchmark inference."
         )
 
     @classmethod
     @check_optional_dependencies()
     def load_model(
         cls,
-        package: Package,
+        package: Package | None = None,
+        model_parallel_size: int | None = None,
         lat_lon: bool = False,
         output_resolution: tuple[int, int] = (181, 360),
-    ) -> AssimilationModel:
-        """Load HealDA-v2 model from package.
+    ) -> "HealDAv2":
+        """Build a randomly initialized HealDA-v2 benchmark model.
 
-        The package is expected to contain::
+        When supplied, the package is expected to contain::
 
-            healda_v2.mdlus                        # VideoHealDA checkpoint
             static/condition_hpx6_padxy.npy        # [1, 2, 1, npix] conditioning
             stats/channel_table.parquet            # global channel stats
             stats/conv_normalizations_by_level.csv # per-level conv stats
@@ -388,8 +630,12 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
         Parameters
         ----------
-        package : Package
-            Package containing model checkpoint and statistics
+        package : Package | None, optional
+            Package containing preprocessing artifacts. Random benchmark assets
+            are generated when omitted, by default None
+        model_parallel_size : int | None, optional
+            Number of ranks splitting the 8-frame time axis. Uses the world
+            size when omitted, by default None
         lat_lon : bool, optional
             If True the output is regridded to a regular lat-lon grid,
             by default False
@@ -399,79 +645,43 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
         Returns
         -------
-        AssimilationModel
-            Loaded HealDA-v2 assimilation model
+        HealDAv2
+            Randomly initialized HealDA-v2 assimilation model
         """
-        model = _VideoHealDAModel.from_checkpoint(package.resolve("healda_v2.mdlus"))
+        device, parallel_size, parallel_rank, parallel_group = _setup_model_parallel(
+            model_parallel_size
+        )
+        torch.manual_seed(0)
+        with torch.device(device):
+            model = _VideoHealDAModel(
+                time_length=N_WINDOW // parallel_size,
+            )
+        if parallel_group is not None:
+            _enable_context_parallel(model, parallel_group, parallel_size)
         model.eval()
 
-        condition = torch.from_numpy(
-            np.load(package.resolve("static/condition_hpx6_padxy.npy"))
-        )
+        if package is None:
+            assets = _random_benchmark_assets(device, int(model.npix))
+        else:
+            assets = _load_package_assets(package, device)
+        condition, era5_mean, era5_std, channel_stats, raw_to_local, codecs = assets
 
-        # Global channel table: microwave + PCA sensor stats keyed by global id
-        channel_table = pd.read_parquet(package.resolve("stats/channel_table.parquet"))
-        channel_stats = channel_table[
-            ["Global_Channel_ID", "mean", "stddev", "min_valid", "max_valid"]
-        ]
-
-        # Append the expanded conv-plevel stats built from the per-level CSV,
-        # with base conv rows providing QC bounds and the surface fallback.
-        level_stats = pd.read_csv(
-            package.resolve("stats/conv_normalizations_by_level.csv")
-        )
-        conv_offset = SENSOR_OFFSET["conv"]
-        base_conv = channel_stats[
-            (channel_stats["Global_Channel_ID"] >= conv_offset)
-            & (channel_stats["Global_Channel_ID"] < conv_offset + len(CONV_CHANNELS))
-        ]
-        plevel_offset = SENSOR_OFFSET["conv-plevel"]
-        channel_stats = pd.concat(
-            [
-                channel_stats[channel_stats["Global_Channel_ID"] < plevel_offset],
-                build_conv_plevel_channel_stats(level_stats, base_conv),
-            ],
-            ignore_index=True,
-        )
-
-        # Microwave raw (GSI) channel id -> local channel lookup tables
-        raw_to_local: dict[str, np.ndarray] = {}
-        for sensor in MW_SENSORS:
-            df = pd.read_csv(
-                package.resolve(f"stats/normalizations/{sensor}_normalizations.csv")
-            )
-            df = df[df["Platform_ID"] == -1]
-            raw_to_local[sensor] = build_raw_to_local_lut(
-                df["Raw_Channel_ID"].to_numpy()
-            )
-
-        # PCA codecs for the compressed infrared sounders
-        codecs = {
-            sensor: PCACodec.load(package.resolve(f"codecs/{sensor}.pt"))
-            for sensor in IR_PCA_SENSORS
-        }
-
-        # ERA5 output normalization stats
-        stats = pd.read_csv(package.resolve("stats/era5_13_levels_stats.csv"))
-        level = stats["level"].astype(int)
-        channel = np.where(
-            level.eq(-1), stats["variable"], stats["variable"] + level.astype(str)
-        )
-        ordered = stats.assign(channel=channel).set_index("channel").loc[ERA5_CHANNELS]
-        era5_mean = torch.from_numpy(ordered["mean"].to_numpy(dtype=np.float32))
-        era5_std = torch.from_numpy(ordered["std"].to_numpy(dtype=np.float32))
-
-        return cls(
+        wrapper = cls(
             model=model,
             condition=condition,
-            era5_mean=era5_mean.view(1, -1, 1, 1),
-            era5_std=era5_std.view(1, -1, 1, 1),
+            era5_mean=era5_mean,
+            era5_std=era5_std,
             channel_stats=channel_stats,
             raw_to_local=raw_to_local,
             codecs=codecs,
+            model_parallel_size=parallel_size,
+            model_parallel_rank=parallel_rank,
+            model_parallel_group=parallel_group,
+            random_assets=package is None,
             lat_lon=lat_lon,
             output_resolution=output_resolution,
         )
+        return wrapper.to(device)
 
     # ------------------------------------------------------------------
     # Per-sensor preprocessing
@@ -640,13 +850,23 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
         footprint_id = df.groupby(_FP_COLS, sort=False).ngroup().to_numpy()
         sensor_channel = df["sensor_index"].to_numpy().astype(np.int64)
-        channel_lookup = {
-            int(sensor_chan): int(gcid)
-            for sensor_chan, gcid in zip(
-                codec.sensor_chan.cpu().numpy(),
-                codec.channel_gcids.cpu().numpy(),
-            )
-        }
+        if self._random_assets:
+            sensor_ids = np.unique(sensor_channel)[: codec.n_channels]
+            channel_lookup = {
+                int(sensor_chan): int(gcid)
+                for sensor_chan, gcid in zip(
+                    sensor_ids,
+                    codec.channel_gcids.cpu().numpy(),
+                )
+            }
+        else:
+            channel_lookup = {
+                int(sensor_chan): int(gcid)
+                for sensor_chan, gcid in zip(
+                    codec.sensor_chan.cpu().numpy(),
+                    codec.channel_gcids.cpu().numpy(),
+                )
+            }
         global_channel = np.array(
             [channel_lookup.get(int(ch), -1) for ch in sensor_channel],
             dtype=np.int64,
@@ -723,17 +943,25 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     # Window assembly and forward
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _frame_valid_times(
-        request_time: np.datetime64, time_length: int
-    ) -> list[pd.Timestamp]:
-        """Valid time of each window frame, ending at ``request_time``."""
+    def _frame_valid_times(self, request_time: np.datetime64) -> list[pd.Timestamp]:
         analysis_time = pd.Timestamp(request_time)
+        first_frame = self._model_parallel_rank * self.frames_per_rank
         return [
             analysis_time
-            - pd.Timedelta(hours=WINDOW_STEP_HOURS * (time_length - 1 - g))
-            for g in range(time_length)
+            - pd.Timedelta(hours=WINDOW_STEP_HOURS * (N_WINDOW - 1 - global_frame))
+            for global_frame in range(first_frame, first_frame + self.frames_per_rank)
         ]
+
+    def input_time_tolerance(
+        self,
+        analysis_time: np.datetime64,
+    ) -> tuple[np.timedelta64, np.timedelta64]:
+        """Return this rank's UFS observation window relative to analysis time."""
+        frame_times = self._frame_valid_times(analysis_time)
+        lower = frame_times[0] - pd.Timedelta(hours=FRAME_CONTEXT_HOURS)
+        upper = frame_times[-1] + pd.Timedelta(hours=FRAME_CONTEXT_HOURS)
+        origin = pd.Timestamp(analysis_time)
+        return (lower - origin).to_timedelta64(), (upper - origin).to_timedelta64()
 
     @staticmethod
     def _slice_frame(
@@ -776,7 +1004,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             Normalized unified observation DataFrame with additional ``frame``
             and ``target_sec`` columns; may be empty
         """
-        frame_times = self._frame_valid_times(request_time, self._time_length)
+        frame_times = self._frame_valid_times(request_time)
         parts: list[pd.DataFrame] = []
         for frame_idx, valid_time in enumerate(frame_times):
             frame_conv = self._slice_frame(conv_obs, valid_time)
@@ -850,7 +1078,10 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         device = self.device
 
         def col(name: str, dtype: torch.dtype) -> torch.Tensor:
-            return torch.as_tensor(obs[name].to_numpy(), dtype=dtype, device=device)
+            values = obs[name].to_numpy()
+            if values.size == 0:
+                return torch.empty(0, dtype=dtype, device=device)
+            return torch.as_tensor(values, dtype=dtype, device=device)
 
         lon = col("lon", torch.float32)
         lat = col("lat", torch.float32)
@@ -884,7 +1115,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         )
 
         # Per-frame calendar features, each shaped [1, time_length]
-        frame_times = self._frame_valid_times(request_time, self._time_length)
+        frame_times = self._frame_valid_times(request_time)
         second_of_day = [
             float((t - t.normalize()).total_seconds()) for t in frame_times
         ]
@@ -920,8 +1151,25 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                 inputs["day_of_year"],
                 inputs["obs_ctx"],
             )
-        # Denormalize: prediction is [batch, channels, time, npix]
-        return self._era5_std * prediction.float() + self._era5_mean
+        # Denormalize the local time shard.
+        prediction = self._era5_std * prediction.float() + self._era5_mean
+        if self._model_parallel_rank == self._model_parallel_size - 1:
+            analysis = prediction[:, :, -1].contiguous()
+        else:
+            analysis = torch.empty_like(prediction[:, :, 0]).contiguous()
+        if self._model_parallel_size > 1:
+            if self._model_parallel_group is None:
+                raise RuntimeError("model_parallel_group is not configured")
+            source = torch_dist.get_global_rank(
+                self._model_parallel_group,
+                self._model_parallel_size - 1,
+            )
+            torch_dist.broadcast(
+                analysis,
+                src=source,
+                group=self._model_parallel_group,
+            )
+        return analysis
 
     # ------------------------------------------------------------------
     # Call / generator
@@ -931,14 +1179,12 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         self,
         conv_obs: pd.DataFrame | None = None,
         sat_obs: pd.DataFrame | None = None,
+        analysis_time: np.datetime64 | dt.datetime | pd.Timestamp | None = None,
     ) -> xr.DataArray:
         """Run HealDA-v2 inference from conventional and/or satellite observations.
 
-        At least one of the two observation DataFrames must be provided. Each
-        DataFrame must carry a single ``request_time`` entry in its ``.attrs``;
-        it is the valid time of the final window frame (the analysis). The
-        DataFrames should cover the full observation window
-        ``(request_time - 45h, request_time + 3h]``.
+        Each rank receives observations only for its assigned frames. The
+        ``analysis_time`` identifies the final global frame.
 
         Parameters
         ----------
@@ -948,14 +1194,15 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         sat_obs : pd.DataFrame | None, optional
             Satellite observation DataFrame from
             :py:class:`earth2studio.data.UFSObsSat`, by default None
+        analysis_time : np.datetime64 | datetime.datetime | pd.Timestamp | None, optional
+            Valid time of the final video frame. Defaults to ``request_time``
+            from an input DataFrame, by default None
 
         Returns
         -------
         xr.DataArray
-            Global analysis window with dimensions
-            [time, lead_time, variable, npix] (or lat/lon). The analysis frame
-            is ``lead_time == 0``. Data is on the same device as the model
-            (cupy array for GPU, numpy for CPU).
+            Final global analysis with dimensions [time, variable, npix] (or
+            lat/lon). Data is on the same device as the model.
 
         Raises
         ------
@@ -966,12 +1213,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         if conv_obs is None and sat_obs is None:
             raise ValueError("At least one of conv_obs or sat_obs must be provided.")
 
-        request_time = None
-        for df in (conv_obs, sat_obs):
-            if df is not None:
-                request_time = df.attrs.get("request_time", None)
-                if request_time is not None:
-                    break
+        request_time: Any = analysis_time
+        if request_time is None:
+            for df in (conv_obs, sat_obs):
+                if df is not None:
+                    request_time = df.attrs.get("request_time", None)
+                    if request_time is not None:
+                        break
         if request_time is None:
             raise ValueError(
                 "Observation DataFrame must have 'request_time' in attrs. "
@@ -990,7 +1238,6 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                 f"{len(request_time)} request times."
             )
 
-        # Convert cudf to pandas if needed
         if cudf is not None:
             if isinstance(conv_obs, cudf.DataFrame):
                 conv_obs = conv_obs.to_pandas()
@@ -1003,15 +1250,30 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         (output_coords,) = self.output_coords(
             self.input_coords(), request_time=request_time
         )
-        if len(obs) == 0:
+        no_observations = len(obs) == 0
+        if self._model_parallel_size > 1:
+            observation_count = torch.tensor(
+                [len(obs)], dtype=torch.int64, device=self.device
+            )
+            torch_dist.all_reduce(
+                observation_count,
+                group=self._model_parallel_group,
+            )
+            no_observations = int(observation_count.item()) == 0
+
+        if no_observations:
             logger.warning("No observations after filtering, returning empty analysis")
             return self._empty_output(output_coords)
+        if len(obs) == 0:
+            logger.warning("No local observations after filtering")
 
         inputs = self.build_input(obs, analysis_time)
         prediction = self._forward(inputs)
         return self.build_output(prediction, output_coords)
 
-    def create_generator(self) -> Generator[
+    def create_generator(
+        self,
+    ) -> Generator[
         xr.DataArray,
         tuple[pd.DataFrame | None, pd.DataFrame | None],
         None,
@@ -1053,17 +1315,16 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         Parameters
         ----------
         prediction : torch.Tensor
-            Model output [batch, variable, time_length, npix]
+            Final analysis [batch, variable, npix]
         output_coords : CoordSystem
             Output coordinate system
 
         Returns
         -------
         xr.DataArray
-            Analysis window, either on HEALPix (npix) or lat-lon grid
+            Final analysis, either on HEALPix (npix) or lat-lon grid
         """
-        # [1, variable, time_length, npix] -> [time, lead_time, variable, npix]
-        out = prediction.permute(0, 2, 1, 3).contiguous()
+        out = prediction.contiguous()
         if self._lat_lon and self._regridder is not None:
             out = self._regridder(out.double())
 
@@ -1075,13 +1336,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         if self._lat_lon:
             return xr.DataArray(
                 data=data,
-                dims=["time", "lead_time", "variable", "lat", "lon"],
+                dims=["time", "variable", "lat", "lon"],
                 coords=output_coords,
             )
 
         return xr.DataArray(
             data=data,
-            dims=["time", "lead_time", "variable", "npix"],
+            dims=["time", "variable", "npix"],
             coords=output_coords,
         )
 

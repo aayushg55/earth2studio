@@ -265,9 +265,14 @@ windgust-afno = [
 # DA Models
 da-healda = [
     "earth2grid",
-    "nvidia-physicsnemo>=2.0,<=2.1.1",
     "cupy-cuda13x",
     "cudf-cu13>=26.2.0",
+    "nvidia-physicsnemo>=2.0",
+]
+da-healda-v2 = [
+    "earth2grid",
+    "cupy-cuda13x",
+    "nvidia-physicsnemo",
 ]
 da-interp = [
     "cupy-cuda13x",
@@ -283,7 +288,7 @@ all = [
     "earth2studio[data,perturbation,statistics,utils,serve]",
     "earth2studio[atlas,aurora,dlesym,dlwp,fcn,fcn3,fengwu,gencast,interp-modafno,pangu,stormcast,sfno,stormscope,graphcast,ucast]",
     "earth2studio[cbottle,climatenet,corrdiff,orbit,precip-afno,cyclone,precip-afno-v2,solarradiation-afno,windgust-afno]",
-    "earth2studio[da-interp,da-stormcast,da-healda]",
+    "earth2studio[da-interp,da-stormcast,da-healda,da-healda-v2]",
 ]
 
 # ==== UV configuration ====
@@ -344,6 +349,9 @@ torch-harmonics = [
 ]
 
 climate-learn = { git = "https://github.com/NickGeneva/ORBIT-2", rev = "5b2d80a8ba4dc95029211ef2b8530d3663f65d39" }
+nvidia-physicsnemo = [
+  { git = "https://github.com/NVIDIA/physicsnemo.git", rev = "fa1d68a67cc77baa176db8b4c1c5ef2ecdce00f7", extra = "da-healda-v2" },
+]
 
 
 [exclude.uv.workspace]
