@@ -41,6 +41,7 @@ from earth2studio.data.utils import (
 )
 from earth2studio.lexicon import GSIConventionalLexicon, GSISatelliteLexicon
 from earth2studio.utils.time import normalize_time_tolerance
+from earth2studio.utils.timing import cpu_timing_range
 from earth2studio.utils.type import TimeArray, TimeTolerance, VariableArray
 
 
@@ -58,6 +59,24 @@ class _GSIAsyncTask:
     satellite: str | None = None
 
 
+_NS_PER_HOUR = np.int64(3_600_000_000_000)
+
+CYCLE_HOURS = 6
+
+
+def _hours_since_to_datetime(values: np.ndarray, origin: datetime) -> np.ndarray:
+    """Convert fractional hours since ``origin`` to ``datetime64[ns]``.
+
+    Bit-exact with ``pd.to_timedelta(values, unit="h") + origin``; the rounding
+    to 12 decimal places is what reproduces the pandas result.
+    """
+    hours = values.astype(np.float64, copy=False)
+    whole_hours = hours.astype(np.int64)
+    fractional_ns = (np.round(hours - whole_hours, 12) * _NS_PER_HOUR).astype(np.int64)
+    offset_ns = whole_hours * _NS_PER_HOUR + fractional_ns
+    return np.datetime64(origin, "ns") + offset_ns.astype("timedelta64[ns]")
+
+
 class _UFSObsBase:
     """Base class for GSI data sources.
 
@@ -68,6 +87,8 @@ class _UFSObsBase:
     UFS_BUCKET = "noaa-ufs-gefsv13replay-pds"
     SOURCE_ID: str  # To be defined by subclasses
     SCHEMA: pa.Schema  # To be defined by subclasses
+    # A GSI diag file is labelled by its synoptic cycle and spans cycle +- 3h
+    CYCLE_HALF_WIDTH = timedelta(hours=3)
 
     def __init__(
         self,
@@ -131,17 +152,20 @@ class _UFSObsBase:
         fields: str | list[str] | pa.Schema | None = None,
     ) -> pd.DataFrame:
         """Async function to get data."""
-        time_list, variable_list = prep_data_inputs(time, variable)
-        self._validate_time(time_list)
-        schema = self.resolve_fields(fields)
-        pathlib.Path(self.cache).mkdir(parents=True, exist_ok=True)
+        with cpu_timing_range("ufs.request_setup"):
+            time_list, variable_list = prep_data_inputs(time, variable)
+            self._validate_time(time_list)
+            schema = self.resolve_fields(fields)
+            pathlib.Path(self.cache).mkdir(parents=True, exist_ok=True)
 
-        async_tasks = self._create_tasks(time_list, variable_list)
-        file_key_set = {task.gsi_obs_key for task in async_tasks}
-        fetch_jobs = [self._fetch_remote_file(key) for key in file_key_set]
-        await tqdm.gather(
-            *fetch_jobs, desc="Fetching GSI files", disable=(not self._verbose)
-        )
+        with cpu_timing_range("ufs.create_tasks"):
+            async_tasks = self._create_tasks(time_list, variable_list)
+            file_key_set = {task.gsi_obs_key for task in async_tasks}
+            fetch_jobs = [self._fetch_remote_file(key) for key in file_key_set]
+        with cpu_timing_range("ufs.fetch_files"):
+            await tqdm.gather(
+                *fetch_jobs, desc="Fetching GSI files", disable=(not self._verbose)
+            )
 
         df = self._compile_dataframe(async_tasks, variable_list, schema)
 
@@ -152,6 +176,30 @@ class _UFSObsBase:
     ) -> list[_GSIAsyncTask]:
         """Create async tasks for fetching data. Must be implemented by subclasses."""
         raise NotImplementedError("Subclasses must implement _create_tasks.")
+
+    def _cycle_window(self, t: datetime) -> tuple[datetime, datetime]:
+        """Half-open observation window ``(t + lower, t + upper]`` for a request."""
+        return t + self._tolerance_lower, t + self._tolerance_upper
+
+    @classmethod
+    def _cycles(cls, tmin: datetime, tmax: datetime) -> list[datetime]:
+        """Cycles whose ``[T - 3h, T + 3h]`` coverage meets the window ``(tmin, tmax]``.
+
+        A cycle qualifies when ``tmin - 3h < T < tmax + 3h``. Windows that end on a
+        cycle edge therefore stop there: widening the request past the edge is what
+        pulls in the neighbouring file.
+        """
+        first = tmin - cls.CYCLE_HALF_WIDTH
+        day = first.replace(minute=0, second=0, microsecond=0)
+        # Round down to a synoptic label, then step past it since T must exceed `first`
+        day = day.replace(hour=(day.hour // CYCLE_HOURS) * CYCLE_HOURS)
+        day += timedelta(hours=CYCLE_HOURS)
+        last = tmax + cls.CYCLE_HALF_WIDTH
+        cycles = []
+        while day < last:
+            cycles.append(day)
+            day += timedelta(hours=CYCLE_HOURS)
+        return cycles
 
     async def _fetch_remote_file(
         self,
@@ -210,75 +258,107 @@ class _UFSObsBase:
                 channel_indexed_fields[gsi_name] = field.name
 
         frames: list[pd.DataFrame] = []
-        for task in async_tasks:
-            # Overwrite obs column name (needed for uv)
-            column_map = self._build_column_map(schema)
-            column_map[task.gsi_obs_name] = "observation"
-            local_path = self.cache_path(task.gsi_obs_key)
+        for group in self._group_tasks(async_tasks):
+            local_path = self.cache_path(group[0].gsi_obs_key)
             if not pathlib.Path(local_path).is_file():
                 logger.warning(
                     "Cached file missing for {}",
-                    f"s3://{self.UFS_BUCKET}/{task.gsi_obs_key}",
+                    f"s3://{self.UFS_BUCKET}/{group[0].gsi_obs_key}",
                 )
                 continue
+            # Tasks in a group share every column but the one supplying
+            # `observation`, so the file is read once and the obs columns fanned out
+            column_map = self._build_column_map(schema)
+            obs_names = {task.gsi_obs_name for task in group}
             try:
-                with h5netcdf.File(local_path, "r") as ds:
-                    data: dict[str, np.ndarray] = {}
+                with cpu_timing_range("ufs.h5_open"):
+                    ds = h5netcdf.File(local_path, "r")
+                try:
+                    data: dict[str, pa.Array] = {}
                     channel_index_raw: np.ndarray | None = None
                     for name, dset in ds.variables.items():
-                        if name not in column_map:
+                        if name not in column_map and name not in obs_names:
                             continue
                         # Skip channel-indexed fields; they are expanded below
                         if name in channel_indexed_fields:
                             continue
-                        values = np.asarray(dset[:])
-                        pa_type = self.SCHEMA.field(column_map[name]).type
+                        with cpu_timing_range("ufs.h5_read"):
+                            values = np.asarray(dset[:])
+                        pa_type = self.SCHEMA.field(
+                            column_map.get(name, "observation")
+                        ).type
                         # Convert char arrays into strings for DF
                         if values.dtype.kind == "S" and values.ndim == 2:
-                            values = values.view(f"S{values.shape[1]}").ravel()
-                            values = np.char.rstrip(
-                                np.char.decode(values, "utf-8"), "\x00"
-                            )
+                            with cpu_timing_range("ufs.string_decode"):
+                                values = values.view(f"S{values.shape[1]}").ravel()
+                                values = np.char.rstrip(
+                                    np.char.decode(values, "utf-8"), "\x00"
+                                )
                         # Apply subclass-specific transformations
-                        values = self._transform_column(name, values, task, ds)
-                        data[name] = pa.array(values, type=pa_type)
+                        with cpu_timing_range("ufs.transform_column"):
+                            values = self._transform_column(name, values, group[0], ds)
+                        with cpu_timing_range("ufs.pa_array"):
+                            data[name] = pa.array(values, type=pa_type)
                         # Stash raw Channel_Index for per-channel expansion
                         if name == "Channel_Index":
-                            channel_index_raw = np.asarray(dset[:])
+                            with cpu_timing_range("ufs.h5_read"):
+                                channel_index_raw = np.asarray(dset[:])
 
                     # Expand channel-indexed fields using Channel_Index as lookup
                     if channel_index_raw is not None:
-                        idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
-                        for gsi_name, field_name in channel_indexed_fields.items():
-                            if gsi_name in ds.variables:
-                                lut = np.asarray(
-                                    ds[gsi_name][:],
-                                    dtype=schema.field(
-                                        field_name
-                                    ).type.to_pandas_dtype(),
-                                )
-                                data[gsi_name] = pa.array(
-                                    lut[idx], type=schema.field(field_name).type
-                                )
-
-                df = pd.DataFrame(data)
+                        with cpu_timing_range("ufs.channel_index_expand"):
+                            idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
+                            for gsi_name, field_name in channel_indexed_fields.items():
+                                if gsi_name in ds.variables:
+                                    lut = np.asarray(
+                                        ds[gsi_name][:],
+                                        dtype=schema.field(
+                                            field_name
+                                        ).type.to_pandas_dtype(),
+                                    )
+                                    data[gsi_name] = pa.array(
+                                        lut[idx], type=schema.field(field_name).type
+                                    )
+                finally:
+                    with cpu_timing_range("ufs.h5_close"):
+                        ds.close()
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("Failed to read {}: {}", local_path, exc)
                 raise exc
 
-            # Rename columns
-            df.rename(columns=column_map, inplace=True)
-            # Add e2s columns
-            df["variable"] = task.e2s_obs_name
-            df.attrs["source"] = self.SOURCE_ID
-            self._add_task_columns(df, task)
+            for task in group:
+                with cpu_timing_range("ufs.dataframe"):
+                    df = pd.DataFrame(
+                        {
+                            name: values
+                            for name, values in data.items()
+                            if name in column_map or name == task.gsi_obs_name
+                        }
+                    )
+                with cpu_timing_range("ufs.add_columns"):
+                    df.rename(
+                        columns={**column_map, task.gsi_obs_name: "observation"},
+                        inplace=True,
+                    )
+                    # Add e2s columns
+                    df["variable"] = task.e2s_obs_name
+                    df.attrs["source"] = self.SOURCE_ID
+                    self._add_task_columns(df, task)
 
-            mask = (df["time"] >= task.datetime_min) & (df["time"] <= task.datetime_max)
-            df = df.loc[mask]
-            frames.append(task.gsi_modifier(df))
+                with cpu_timing_range("ufs.time_filter"):
+                    # Half-open (min, max] so adjacent request windows tile without
+                    # double-counting observations on a cycle boundary
+                    mask = (df["time"] > task.datetime_min) & (
+                        df["time"] <= task.datetime_max
+                    )
+                    df = df.loc[mask]
+                with cpu_timing_range("ufs.modifier"):
+                    frames.append(task.gsi_modifier(df))
 
-        result = pd.concat(frames, ignore_index=True)
-        return result[[name for name in schema.names if name in result.columns]]
+        with cpu_timing_range("ufs.concat"):
+            result = pd.concat(frames, ignore_index=True)
+        with cpu_timing_range("ufs.select_columns"):
+            return result[[name for name in schema.names if name in result.columns]]
 
     def _build_column_map(self, schema: pa.Schema) -> dict[str, str]:
         """Build mapping from GSI column names to schema column names."""
@@ -305,6 +385,22 @@ class _UFSObsBase:
     def _add_task_columns(self, df: pd.DataFrame, task: _GSIAsyncTask) -> None:
         """Add task-specific columns to DataFrame. Override in subclasses."""
         pass
+
+    @staticmethod
+    def _group_tasks(
+        async_tasks: list[_GSIAsyncTask],
+    ) -> list[list[_GSIAsyncTask]]:
+        """Group tasks reading the same file over the same window.
+
+        GSI packs several observed quantities into one file (u and v in
+        ``diag_conv_uv``, bending angle and level-2 retrievals in
+        ``diag_conv_gps``), which would otherwise be decoded once per variable.
+        """
+        groups: dict[tuple[str, datetime, datetime], list[_GSIAsyncTask]] = {}
+        for task in async_tasks:
+            key = (task.gsi_obs_key, task.datetime_min, task.datetime_max)
+            groups.setdefault(key, []).append(task)
+        return list(groups.values())
 
     @classmethod
     def resolve_fields(cls, fields: str | list[str] | pa.Schema | None) -> pa.Schema:
@@ -518,11 +614,8 @@ class UFSObsConv(_UFSObsBase):
                 raise
 
             for t in time_list:
-                tmin = t + self._tolerance_lower
-                tmax = t + self._tolerance_upper
-                day = tmin.replace(minute=0, second=0, microsecond=0)
-                day = day.replace(hour=(day.hour // 6) * 6)
-                while day <= tmax:
+                tmin, tmax = self._cycle_window(t)
+                for day in self._cycles(tmin, tmax):
                     year_key = day.strftime("%Y")
                     month_key = day.strftime("%m")
                     datetime_key = day.strftime("%Y%m%d%H")
@@ -538,7 +631,6 @@ class UFSObsConv(_UFSObsBase):
                             e2s_obs_name=v,
                         )
                     )
-                    day = day + timedelta(hours=6)
         return tasks
 
     def _transform_column(
@@ -551,7 +643,7 @@ class UFSObsConv(_UFSObsBase):
         """Transform column values for conventional data."""
         # Convert hours offset to timedelta, and add to datetime of file
         if name == "Time":
-            values = pd.to_timedelta(values, unit="h") + task.datetime_file
+            values = _hours_since_to_datetime(values, task.datetime_file)
         # GSI stores Pressure in hPa (mb), convert to Pa
         elif name == "Pressure":
             values = values * 100.0
@@ -733,11 +825,8 @@ class UFSObsSat(_UFSObsBase):
 
             for gsi_platform in gsi_platforms:
                 for t in time_list:
-                    tmin = t + self._tolerance_lower
-                    tmax = t + self._tolerance_upper
-                    day = tmin.replace(minute=0, second=0, microsecond=0)
-                    day = day.replace(hour=(day.hour // 6) * 6)
-                    while day <= tmax:
+                    tmin, tmax = self._cycle_window(t)
+                    for day in self._cycles(tmin, tmax):
                         year_key = day.strftime("%Y")
                         month_key = day.strftime("%m")
                         datetime_key = day.strftime("%Y%m%d%H")
@@ -754,7 +843,6 @@ class UFSObsSat(_UFSObsBase):
                                 satellite=gsi_platform,
                             )
                         )
-                        day = day + timedelta(hours=6)
         return tasks
 
     def _handle_missing_file(self, key: str) -> None:
@@ -784,7 +872,7 @@ class UFSObsSat(_UFSObsBase):
         """Transform column values for satellite data."""
         # Convert hours offset to timedelta, and add to datetime of file
         if name == "Obs_Time":
-            values = pd.to_timedelta(values, unit="h") + task.datetime_file
+            values = _hours_since_to_datetime(values, task.datetime_file)
         return values
 
     def _add_task_columns(self, df: pd.DataFrame, task: _GSIAsyncTask) -> None:

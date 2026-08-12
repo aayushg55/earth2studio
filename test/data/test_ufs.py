@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 
 from earth2studio.data import UFSObsConv, UFSObsSat
+from earth2studio.data.ufs import _hours_since_to_datetime
 
 
 @pytest.mark.slow
@@ -174,6 +175,94 @@ def test_ufsobsconv_tolerance_conversion():
     )
     assert ds_asym._tolerance_lower == timedelta(hours=-3)
     assert ds_asym._tolerance_upper == timedelta(hours=1)
+
+
+def test_ufs_time_conversion_matches_pandas():
+    values = np.array(
+        [-45.0, -0.54487, -0.0001, 0.0, 0.12345679, 3.0],
+        dtype=np.float32,
+    )
+    origin = datetime(2024, 1, 1)
+    expected = (pd.to_timedelta(values, unit="h") + origin).to_numpy()
+
+    result = _hours_since_to_datetime(values, origin)
+
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_ufs_time_conversion_matches_pandas_over_cycle_range():
+    """GSI stores whole-cycle offsets in [-3h, +3h]; match pandas across that span."""
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-3.0, 3.0, 100_000).astype(np.float32)
+    origin = datetime(2024, 1, 1)
+    expected = (pd.to_timedelta(values, unit="h") + origin).to_numpy()
+
+    result = _hours_since_to_datetime(values, origin)
+
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "tolerance,expected",
+    [
+        # A 48h HealDA-v2 window is the 8 cycles it is built from, not 9 or 10
+        ((timedelta(hours=-45), timedelta(hours=3)), 8),
+        # A single 6h frame is a single file
+        ((timedelta(hours=-3), timedelta(hours=3)), 1),
+        ((timedelta(hours=-45), timedelta(hours=-39)), 1),
+        # Sub-cycle windows stay within the one cycle that covers them
+        ((timedelta(hours=-1), timedelta(hours=1)), 1),
+        # Reaching past a cycle edge is what pulls in the neighbouring file
+        ((timedelta(hours=-4), timedelta(hours=4)), 3),
+        ((timedelta(hours=-45), timedelta(hours=3, minutes=6)), 9),
+    ],
+)
+def test_ufs_cycle_selection(tolerance, expected):
+    analysis = datetime(2024, 1, 1)
+    cycles = UFSObsConv._cycles(analysis + tolerance[0], analysis + tolerance[1])
+
+    assert len(cycles) == expected
+    assert all(cycle.hour % 6 == 0 for cycle in cycles)
+    # Every selected cycle must overlap the requested window
+    for cycle in cycles:
+        assert cycle + timedelta(hours=3) > analysis + tolerance[0]
+        assert cycle - timedelta(hours=3) < analysis + tolerance[1]
+
+
+def test_ufs_adjacent_windows_select_disjoint_cycles():
+    """Contiguous rank-local windows must not both claim the shared cycle file."""
+    analysis = datetime(2024, 1, 1)
+    left = UFSObsConv._cycles(
+        analysis + timedelta(hours=-45), analysis + timedelta(hours=-33)
+    )
+    right = UFSObsConv._cycles(
+        analysis + timedelta(hours=-33), analysis + timedelta(hours=-21)
+    )
+
+    assert set(left).isdisjoint(right)
+
+
+def test_ufs_conv_groups_tasks_sharing_a_file():
+    """u/v live in diag_conv_uv, so both must be served by a single decode."""
+    source = UFSObsConv(
+        time_tolerance=(timedelta(hours=-3), timedelta(hours=3)), cache=False
+    )
+    tasks = source._create_tasks([datetime(2024, 1, 1)], ["u", "v", "t"])
+    groups = source._group_tasks(tasks)
+
+    assert len(tasks) == 3
+    assert len(groups) == 2
+    uv_group = next(group for group in groups if len(group) > 1)
+    assert {task.e2s_obs_name for task in uv_group} == {"u", "v"}
+    assert len({task.gsi_obs_key for task in uv_group}) == 1
+
+
+def test_ufs_sat_tasks_never_share_a_file():
+    source = UFSObsSat(time_tolerance=(timedelta(hours=-45), timedelta(hours=3)))
+    tasks = source._create_tasks([datetime(2024, 1, 1)], ["atms", "amsua"])
+    groups = source._group_tasks(tasks)
+
+    assert len(groups) == len(tasks)
 
 
 @pytest.mark.slow
