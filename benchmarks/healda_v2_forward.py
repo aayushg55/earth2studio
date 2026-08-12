@@ -1,6 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Timed VideoHealDA forward passes, without the earth2studio preprocessing around it.
+
+    torchrun --standalone --nproc-per-node=4 \
+      benchmarks/healda_v2_forward.py --model-parallel-size=4
+
+--model-parallel-size must equal --nproc-per-node.
+"""
+
 import argparse
 import os
 

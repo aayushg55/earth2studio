@@ -1,6 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Timed HealDA-v2 assimilation, from observation DataFrames to a global analysis.
+
+Random weights and random preprocessing assets, so the timings are meaningful and
+the fields are not. For a real analysis see
+examples/05_data_assimilation/03_healda_v2.py.
+
+    # real UFS replay observations
+    torchrun --standalone --nproc-per-node=4 \
+      benchmarks/healda_v2_end_to_end.py --model-parallel-size=4
+
+    # 1.25M conventional and 1.25M satellite observations per frame
+    torchrun --standalone --nproc-per-node=4 \
+      benchmarks/healda_v2_end_to_end.py --model-parallel-size=4 --random-data
+
+--model-parallel-size must equal --nproc-per-node.
+"""
+
 import argparse
 import os
 import time
