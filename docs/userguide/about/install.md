@@ -792,7 +792,8 @@ uv add earth2studio --extra da-healda
 
 HealDA-v2 runs the `VideoHealDA` network from PhysicsNeMo, which no PhysicsNeMo release
 carries yet, so no version constraint can pull it. Both tabs install the pinned revision
-explicitly. The `tool.uv.sources` entry in this repository applies to work inside the
+explicitly, and before the extra, whose unpinned `nvidia-physicsnemo` is then already
+satisfied. The `tool.uv.sources` entry in this repository applies to work inside the
 repository, not to a project depending on it.
 :::
 ::::{tab-set}
@@ -800,17 +801,17 @@ repository, not to a project depending on it.
 
 ```bash
 pip install hatchling
+pip install "nvidia-physicsnemo @ git+https://github.com/NVIDIA/physicsnemo.git@fa1d68a67cc77baa176db8b4c1c5ef2ecdce00f7"
 pip install --no-build-isolation "earth2grid @ git+https://github.com/NVlabs/earth2grid@11dcf1b0787a7eb6a8497a3a5a5e1fdcc31232d3"
 pip install earth2studio[da-healda-v2]
-pip install "nvidia-physicsnemo @ git+https://github.com/NVIDIA/physicsnemo.git@fa1d68a67cc77baa176db8b4c1c5ef2ecdce00f7"
 ```
 
 :::
 :::{tab-item} uv
 
 ```bash
-uv add earth2studio --extra da-healda-v2
 uv add "nvidia-physicsnemo @ git+https://github.com/NVIDIA/physicsnemo.git@fa1d68a67cc77baa176db8b4c1c5ef2ecdce00f7"
+uv add earth2studio --extra da-healda-v2
 ```
 
 :::
