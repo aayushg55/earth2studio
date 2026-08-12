@@ -167,6 +167,14 @@ CONV_VAR_CHANNEL: dict[str, int] = {
     "v": CONV_CHANNEL_NAMES.index("v"),
 }
 
+# Variables worth requesting from a data source. GPS level-2 retrievals are
+# accepted by CONV_VAR_CHANNEL but dropped by QC, so fetching them is wasted.
+CONV_REQUEST_VARIABLES: list[str] = [
+    name
+    for name, channel in CONV_VAR_CHANNEL.items()
+    if channel not in CONV_GPS_LEVEL2_CHANNELS
+]
+
 
 class QCLimits:
     """Conventional observation QC filtering limits."""
