@@ -37,5 +37,6 @@ to process observations independently or maintain internal state across time ste
       :template: dataassim.rst
 
       HealDA
+      HealDAv2
       InterpEquirectangular
       StormCastSDA

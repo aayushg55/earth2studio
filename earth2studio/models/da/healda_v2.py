@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import datetime as dt
+import os
 from collections import OrderedDict
 from collections.abc import Generator
 from typing import Any, cast
@@ -88,6 +89,11 @@ N_WINDOW = 8
 WINDOW_STEP_HOURS = 6
 FRAME_CONTEXT_HOURS = 3
 MODEL_PARALLEL_SIZES = (1, 2, 4, 8)
+
+# Environment variable naming the model package root. Accepts any fsspec root:
+# a local directory, s3://bucket/prefix or hf://org/repo@revision.
+PACKAGE_ENV_VAR = "HEALDA_V2_PACKAGE"
+CHECKPOINT_FILE = "healda_v2.mdlus"
 
 # Microwave sounders consumed directly and infrared sounders consumed through
 # PCA compression. UFSObsSat variable names for the raw IR sensors differ from
@@ -596,17 +602,30 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
     @classmethod
     def load_default_package(cls) -> Package:
-        """Load the default HealDA-v2 model package.
+        """Load the HealDA-v2 model package named by ``$HEALDA_V2_PACKAGE``.
+
+        The variable holds any fsspec root: a local directory,
+        ``s3://bucket/prefix`` or ``hf://org/repo@revision``. Remote roots are
+        cached under ``$EARTH2STUDIO_CACHE``.
+
+        Returns
+        -------
+        Package
+            Model package rooted at the configured location
 
         Raises
         ------
-        NotImplementedError
-            The HealDA-v2 model package has not been published yet
+        RuntimeError
+            The environment variable is unset
         """
-        raise NotImplementedError(
-            "The HealDA-v2 model package has not been published yet. Use "
-            "load_model() without a package for benchmark inference."
-        )
+        root = os.environ.get(PACKAGE_ENV_VAR)
+        if not root:
+            raise RuntimeError(
+                f"Set {PACKAGE_ENV_VAR} to the directory or URI holding "
+                f"{CHECKPOINT_FILE} and its preprocessing artifacts, or pass a "
+                f"Package to load_model()."
+            )
+        return Package(root)
 
     @classmethod
     @check_optional_dependencies()
@@ -617,10 +636,12 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         lat_lon: bool = False,
         output_resolution: tuple[int, int] = (181, 360),
     ) -> "HealDAv2":
-        """Build a randomly initialized HealDA-v2 benchmark model.
+        """Build a HealDA-v2 model, from a package's weights or randomly.
 
-        When supplied, the package is expected to contain::
+        A package holds the trained weights and the preprocessing artifacts they
+        were trained with::
 
+            healda_v2.mdlus                        # weights, no optimizer state
             static/condition_hpx6_padxy.npy        # [1, 2, 1, npix] conditioning
             stats/channel_table.parquet            # global channel stats
             stats/conv_normalizations_by_level.csv # per-level conv stats
@@ -628,11 +649,14 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             stats/normalizations/{sensor}_normalizations.csv  # MW raw ids
             codecs/{iasi,cris-fsr,airs}-pca.pt     # PCA codecs
 
+        Omitting the package builds random weights and random assets, which is
+        for benchmarking throughput only.
+
         Parameters
         ----------
         package : Package | None, optional
-            Package containing preprocessing artifacts. Random benchmark assets
-            are generated when omitted, by default None
+            Package holding the weights and preprocessing artifacts. Random
+            weights and assets are generated when omitted, by default None
         model_parallel_size : int | None, optional
             Number of ranks splitting the 8-frame time axis. Uses the world
             size when omitted, by default None
@@ -640,22 +664,31 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             If True the output is regridded to a regular lat-lon grid,
             by default False
         output_resolution : tuple[int, int], optional
-            ``(nlat, nlon)`` size of the output lat-lon grid. Only used when
-            ``lat_lon=True``, by default ``(181, 360)``
+            ``(nlat, nlon)`` size of the output lat-lon grid, reached in one
+            bilinear step from the native HEALPix level-6 grid. Only used when
+            ``lat_lon=True``. ``(721, 1440)`` gives 0.25 degrees; by default
+            ``(181, 360)``, 1 degree
 
         Returns
         -------
         HealDAv2
-            Randomly initialized HealDA-v2 assimilation model
+            HealDA-v2 assimilation model
         """
         device, parallel_size, parallel_rank, parallel_group = _setup_model_parallel(
             model_parallel_size
         )
         torch.manual_seed(0)
-        with torch.device(device):
-            model = _VideoHealDAModel(
-                time_length=N_WINDOW // parallel_size,
-            )
+        time_length = N_WINDOW // parallel_size
+        if package is None:
+            with torch.device(device):
+                model = _VideoHealDAModel(time_length=time_length)
+        else:
+            checkpoint = package.resolve(CHECKPOINT_FILE)
+            with torch.device(device):
+                model = _VideoHealDAModel.from_checkpoint(checkpoint)
+            # time_length is the frame count forward() asserts against, not a weight
+            # shape, so a rank's share of the window is set after construction.
+            model.time_length = time_length
         if parallel_group is not None:
             _enable_context_parallel(model, parallel_group, parallel_size)
         model.eval()
