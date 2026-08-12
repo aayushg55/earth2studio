@@ -243,10 +243,8 @@ for row, var in enumerate(plot_vars):
     ]
     for col, (label, field, cmap, limit) in enumerate(panels):
         ax = axes[row, col]
-        # imshow warps the field as a raster. pcolormesh reprojects a million quads per
-        # panel instead, which costs 12 s against 0.8 s here. The extent spans a full 360
-        # degrees rather than ending at the last cell centre, or a seam opens at the
-        # prime meridian.
+        # Rasterized warp, 15x cheaper than pcolormesh at this resolution. The extent
+        # spans a full 360 degrees or a seam opens at the prime meridian.
         im = ax.imshow(
             field,
             transform=ccrs.PlateCarree(),
