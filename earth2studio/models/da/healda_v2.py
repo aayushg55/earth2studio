@@ -606,7 +606,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
         The variable holds any fsspec root: a local directory,
         ``s3://bucket/prefix`` or ``hf://org/repo@revision``. Remote roots are
-        cached under ``$EARTH2STUDIO_CACHE``.
+        cached under ``$EARTH2STUDIO_CACHE``; local ones are read in place.
+
+        A package can also be constructed directly and handed to
+        :py:meth:`load_model`, which is the usual route for a package that is
+        not the default one::
+
+            HealDAv2.load_model(Package("/path/to/package"))
 
         Returns
         -------
@@ -625,7 +631,9 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                 f"{CHECKPOINT_FILE} and its preprocessing artifacts, or pass a "
                 f"Package to load_model()."
             )
-        return Package(root)
+        # same_names keeps cached files under their own basenames, as the v1
+        # package does. Package only caches remote roots.
+        return Package(root, cache_options={"same_names": True})
 
     @classmethod
     @check_optional_dependencies()

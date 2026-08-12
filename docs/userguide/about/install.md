@@ -791,7 +791,9 @@ uv add earth2studio --extra da-healda
 :class: warning
 
 HealDA-v2 runs the `VideoHealDA` network from PhysicsNeMo, which no PhysicsNeMo release
-carries yet. Install the pinned revision below; `uv` takes it from `tool.uv.sources`.
+carries yet, so no version constraint can pull it. Both tabs install the pinned revision
+explicitly. The `tool.uv.sources` entry in this repository applies to work inside the
+repository, not to a project depending on it.
 :::
 ::::{tab-set}
 :::{tab-item} pip
@@ -808,6 +810,7 @@ pip install "nvidia-physicsnemo @ git+https://github.com/NVIDIA/physicsnemo.git@
 
 ```bash
 uv add earth2studio --extra da-healda-v2
+uv add "nvidia-physicsnemo @ git+https://github.com/NVIDIA/physicsnemo.git@fa1d68a67cc77baa176db8b4c1c5ef2ecdce00f7"
 ```
 
 :::
