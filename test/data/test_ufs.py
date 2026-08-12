@@ -24,7 +24,7 @@ import pyarrow as pa
 import pytest
 
 from earth2studio.data import UFSObsConv, UFSObsSat
-from earth2studio.data.ufs import _hours_since_to_datetime
+from earth2studio.data.ufs import _MIN_PARALLEL_FILES, _hours_since_to_datetime
 
 
 @pytest.mark.slow
@@ -263,6 +263,41 @@ def test_ufs_sat_tasks_never_share_a_file():
     groups = source._group_tasks(tasks)
 
     assert len(groups) == len(tasks)
+
+
+@pytest.mark.parametrize("cls", [UFSObsConv, UFSObsSat])
+def test_ufsobs_decode_workers_floor(cls):
+    ds = cls(decode_workers=0, cache=False, verbose=False)
+    assert ds._decode_workers == 1
+
+
+@pytest.mark.slow
+@pytest.mark.xfail
+@pytest.mark.timeout(300)
+def test_ufsobssat_decode_workers_agree():
+    """Pooled and in-process decode must return the same frame.
+
+    The pool decodes in worker processes and applies the observation modifiers back
+    in the parent, so this is the check that the split preserves the result.
+    """
+    time = datetime(year=2024, month=1, day=1, hour=0)
+    # Wide enough to span more cycles than _MIN_PARALLEL_FILES, or the pooled arm
+    # falls back to in-process decode and the comparison is vacuous
+    kwargs = dict(
+        time_tolerance=(timedelta(hours=-21), timedelta(hours=3)),
+        satellites=["npp"],
+        cache=True,
+        verbose=False,
+    )
+
+    pooled_source = UFSObsSat(decode_workers=4, **kwargs)
+    tasks = pooled_source._create_tasks([time], ["atms"])
+    assert len(pooled_source._group_tasks(tasks)) >= _MIN_PARALLEL_FILES
+
+    serial = UFSObsSat(decode_workers=1, **kwargs)(time, ["atms"])
+    pooled = pooled_source(time, ["atms"])
+
+    pd.testing.assert_frame_equal(serial, pooled)
 
 
 @pytest.mark.parametrize("cls", [UFSObsConv, UFSObsSat])

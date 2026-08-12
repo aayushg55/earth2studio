@@ -3,9 +3,9 @@
 
 """Timed HealDA-v2 assimilation, from observation DataFrames to a global analysis.
 
-Random weights and random preprocessing assets, so the timings are meaningful and
-the fields are not. For a real analysis see
-examples/05_data_assimilation/03_healda_v2.py.
+Weights and preprocessing assets are random unless ``--package`` names a model
+package, so by default the timings are meaningful and the fields are not. For a real
+analysis see examples/05_data_assimilation/03_healda_v2.py.
 
     # real UFS replay observations
     torchrun --standalone --nproc-per-node=4 \
@@ -28,6 +28,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 
+from earth2studio.models.auto import Package
 from earth2studio.models.da.healda_v2 import (
     N_WINDOW,
     WINDOW_STEP_HOURS,
@@ -49,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         choices=(1, 2, 4, 8),
         required=True,
+    )
+    parser.add_argument(
+        "--package",
+        default=None,
+        help="Model package root. Omit for random weights and assets.",
     )
     parser.add_argument("--random-data", action="store_true")
     parser.add_argument("--conv-obs-per-frame", type=int, default=1_250_000)
@@ -190,8 +196,16 @@ def main() -> None:
             f"model_parallel_size {args.model_parallel_size}"
         )
     os.environ["EARTH2STUDIO_CACHE"] = args.cache_dir
-    model = HealDAv2.load_model(model_parallel_size=args.model_parallel_size)
+    load_start = time.perf_counter()
+    model = HealDAv2.load_model(
+        package=Package(args.package, cache_options={"same_names": True})
+        if args.package
+        else None,
+        model_parallel_size=args.model_parallel_size,
+    )
+    load_wall = time.perf_counter() - load_start
     analysis_time = np.datetime64(args.analysis_time)
+    obs_start = time.perf_counter()
     if args.random_data:
         conv_obs, sat_obs = make_random_observations(
             model,
@@ -203,6 +217,7 @@ def main() -> None:
     else:
         conv_obs, sat_obs = _fetch_ufs_observations(model, analysis_time)
         data_source = "ufs"
+    obs_wall = time.perf_counter() - obs_start
 
     tolerance_hours = tuple(
         int(value / np.timedelta64(1, "h"))
@@ -231,15 +246,21 @@ def main() -> None:
         )
 
     result = None
+    warmups = []
     for index in range(args.warmup):
+        start = time.perf_counter()
         result = model(
             conv_obs=conv_obs,
             sat_obs=sat_obs,
             analysis_time=analysis_time,
         )
         torch.cuda.synchronize(model.device)
+        warmups.append((time.perf_counter() - start) * 1000.0)
         if model.model_parallel_rank == 0:
-            print(f"warmup={index + 1}/{args.warmup}", flush=True)
+            print(
+                f"warmup={index + 1}/{args.warmup} latency_ms={warmups[-1]:.3f}",
+                flush=True,
+            )
 
     latencies = []
     for index in range(args.iterations):
@@ -268,8 +289,22 @@ def main() -> None:
     if model.model_parallel_rank == 0:
         if result is None:
             raise RuntimeError("No benchmark iterations completed")
-        print(f"mean_latency_ms={sum(latencies) / len(latencies):.3f}", flush=True)
+        steady = sum(latencies) / len(latencies)
+        print(f"mean_latency_ms={steady:.3f}", flush=True)
         print(f"analysis_shape={result.shape}", flush=True)
+        # One cold analysis is the load, the observations and the first model call; the
+        # first call carries CUDA context and kernel compilation that later calls do not.
+        first = warmups[0] if warmups else latencies[0]
+        print(
+            f"\nload_s={load_wall:.3f} obs_{data_source}_s={obs_wall:.3f} "
+            f"first_call_s={first / 1e3:.3f} steady_call_s={steady / 1e3:.3f}",
+            flush=True,
+        )
+        print(
+            f"cold_analysis_s={load_wall + obs_wall + first / 1e3:.3f} "
+            f"warm_analysis_s={obs_wall + steady / 1e3:.3f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

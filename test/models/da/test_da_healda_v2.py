@@ -30,6 +30,8 @@ from earth2studio.models.da.healda_v2 import (
     HealDAv2,
     _choose_model_parallel_size,
     _ContextParallelRotaryEmbedding,
+    _factorize_footprints,
+    _FP_COLS,
     _random_benchmark_assets,
 )
 from earth2studio.models.da.healda_v2_utils import (
@@ -494,6 +496,53 @@ def test_prep_ir_pca():
     np.testing.assert_allclose(out["observation"].to_numpy()[:2], expected, rtol=1e-6)
     # Footprint metadata repeated per latent
     np.testing.assert_allclose(out["lat"].to_numpy(), [10.0, 10.0, 30.0, 30.0])
+
+
+def _footprint_frame(n_footprints: int, n_channels: int) -> pd.DataFrame:
+    """Long-format IR rows, channels of a footprint adjacent, as the diag files are."""
+    rng = np.random.default_rng(0)
+    base = pd.DataFrame(
+        {
+            "time": REQUEST_TIME[0].astype("datetime64[ns]")
+            + rng.integers(0, 4, n_footprints) * np.timedelta64(1, "m"),
+            "lat": rng.uniform(-90, 90, n_footprints).astype(np.float32),
+            "lon": rng.uniform(0, 360, n_footprints).astype(np.float32),
+            "scan_angle": rng.uniform(-60, 60, n_footprints).astype(np.float32),
+            "satellite_za": rng.uniform(0, 65, n_footprints).astype(np.float32),
+            "solza": rng.uniform(0, 180, n_footprints).astype(np.float32),
+            "satellite": pd.Categorical(
+                rng.choice(["npp", "n20"], n_footprints), categories=["npp", "n20"]
+            ),
+        }
+    )
+    df = base.loc[base.index.repeat(n_channels)].reset_index(drop=True)
+    df["sensor_index"] = np.tile(np.arange(n_channels), n_footprints)
+    return df
+
+
+@pytest.mark.parametrize("n_footprints,n_channels", [(50, 7), (1, 3), (200, 1)])
+def test_factorize_footprints_matches_groupby(n_footprints, n_channels):
+    df = _footprint_frame(n_footprints, n_channels)
+    expected = df.groupby(_FP_COLS, sort=False).ngroup().to_numpy()
+
+    np.testing.assert_array_equal(_factorize_footprints(df, _FP_COLS), expected)
+
+
+def test_factorize_footprints_splits_on_one_differing_column():
+    df = _footprint_frame(4, 3)
+    # Footprints 1 and 2 agree everywhere but solza, so they must not merge
+    df.loc[3:8, _FP_COLS] = df.loc[3, _FP_COLS].to_numpy()
+    df.loc[6:8, "solza"] = df.loc[3, "solza"] + 1.0
+
+    footprint_id = _factorize_footprints(df, _FP_COLS)
+
+    assert footprint_id.tolist() == [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+
+
+def test_factorize_footprints_empty():
+    df = _footprint_frame(2, 2).iloc[:0]
+
+    assert _factorize_footprints(df, _FP_COLS).tolist() == []
 
 
 def test_frame_bucketing():
