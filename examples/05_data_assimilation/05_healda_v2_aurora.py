@@ -187,6 +187,7 @@ forecast_seconds = time.perf_counter() - forecast_start
 logger.success(f"{nsteps} six-hour steps in {forecast_seconds:.1f} s")
 
 lead_24h = np.timedelta64(24, "h")
+lead_hours = lead_24h.astype("timedelta64[h]").astype(int)
 valid_time = init_time + lead_24h
 
 # %%
@@ -199,7 +200,7 @@ import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
 plot_vars = ["t2m", "z500", "u500", "q700"]
-cmaps = ["Spectral_r", "PRGn", "RdBu_r", "BrBG"]
+cmaps = ["Spectral_r", "viridis", "RdBu_r", "viridis"]
 lat = coords["lat"]
 lon = coords["lon"]
 
@@ -224,7 +225,7 @@ for row, var in enumerate(plot_vars):
     difference = predicted - truth
     scale = np.abs(difference).max()
     panels = [
-        ("Aurora +24h", predicted, cmaps[row], None),
+        (f"Aurora +{lead_hours} h", predicted, cmaps[row], None),
         ("ERA5", truth, cmaps[row], None),
         (
             f"difference, rmse {np.sqrt((difference**2).mean()):.3g}",
@@ -250,7 +251,8 @@ for row, var in enumerate(plot_vars):
         ax.set_title(f"{var} {label}", fontsize=12)
 
 fig.suptitle(
-    f"Aurora from HealDA-v2 analyses, valid {str(valid_time[0])[:16]} UTC",
+    f"Aurora initialized by HealDA-v2 at {str(init_time[0])[:16]} UTC, "
+    f"lead +{lead_hours} h, valid {str(valid_time[0])[:16]} UTC",
     fontsize=18,
     y=0.99,
 )

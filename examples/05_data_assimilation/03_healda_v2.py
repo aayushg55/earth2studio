@@ -165,7 +165,7 @@ fig.subplots_adjust(wspace=0.02, hspace=0.08, left=0.1, right=0.9)
 
 lat = results[0].coords["lat"].values
 lon = results[0].coords["lon"].values
-cmaps = ["Spectral_r", "PRGn"]
+cmaps = ["Spectral_r", "viridis"]
 
 
 def to_numpy(arr):

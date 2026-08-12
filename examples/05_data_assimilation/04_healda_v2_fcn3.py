@@ -104,9 +104,11 @@ px_model = FCN3.load_model(FCN3.load_default_package()).to(device)
 # Eight frames at six-hour spacing ending at the analysis time, each frame taking its
 # own observations, so the window reaches 45 hours back.
 #
-# The fetch reads a few hundred GSI diagnostic files from S3 and dominates the wall
-# clock on a cold cache; :py:class:`earth2studio.data.UFSObsConv` and
-# :py:class:`earth2studio.data.UFSObsSat` cache them, so a repeat run is far quicker.
+# The window spans nine six-hourly cycles, and each cycle has one GSI diagnostic file
+# per observation type: 45 conventional and 216 satellite files for this analysis. That
+# fetch dominates the wall clock on a cold cache;
+# :py:class:`earth2studio.data.UFSObsConv` and :py:class:`earth2studio.data.UFSObsSat`
+# cache the files, so a repeat run is far quicker.
 
 # %%
 analysis_time = np.array([np.datetime64("2024-01-01T00:00")])
@@ -192,6 +194,7 @@ forecast_seconds = time.perf_counter() - forecast_start
 logger.success(f"{nsteps} six-hour steps in {forecast_seconds:.1f} s")
 
 lead_24h = np.timedelta64(24, "h")
+lead_hours = lead_24h.astype("timedelta64[h]").astype(int)
 valid_time = analysis_time + lead_24h
 
 # %%
@@ -204,7 +207,7 @@ import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
 plot_vars = ["t2m", "z500", "u500", "q700"]
-cmaps = ["Spectral_r", "PRGn", "RdBu_r", "BrBG"]
+cmaps = ["Spectral_r", "viridis", "RdBu_r", "viridis"]
 lat = coords["lat"]
 lon = coords["lon"]
 
@@ -229,7 +232,7 @@ for row, var in enumerate(plot_vars):
     difference = predicted - truth
     scale = np.abs(difference).max()
     panels = [
-        ("FCN3 +24h", predicted, cmaps[row], None),
+        (f"FCN3 +{lead_hours} h", predicted, cmaps[row], None),
         ("ERA5", truth, cmaps[row], None),
         (
             f"difference, rmse {np.sqrt((difference**2).mean()):.3g}",
@@ -255,7 +258,8 @@ for row, var in enumerate(plot_vars):
         ax.set_title(f"{var} {label}", fontsize=12)
 
 fig.suptitle(
-    f"FCN3 from a HealDA-v2 analysis, valid {str(valid_time[0])[:16]} UTC",
+    f"FCN3 initialized by HealDA-v2 at {str(analysis_time[0])[:16]} UTC, "
+    f"lead +{lead_hours} h, valid {str(valid_time[0])[:16]} UTC",
     fontsize=18,
     y=0.99,
 )
