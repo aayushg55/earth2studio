@@ -34,6 +34,7 @@ In this example you will learn:
 - Choosing the resolution of the lat-lon output
 - Comparing the analysis against ERA5
 """
+
 # /// script
 # dependencies = [
 #   "earth2studio[da-healda-v2] @ git+https://github.com/NVIDIA/earth2studio.git",

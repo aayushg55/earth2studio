@@ -396,7 +396,8 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     The model accepts observation DataFrames (from
     :py:class:`earth2studio.data.UFSObsConv` and
     :py:class:`earth2studio.data.UFSObsSat`) and produces a global analysis on
-    the HEALPix level-6 HEALPIX_PAD_XY pixel order with ERA5-compatible variables.
+    the HEALPix level-6 grid in HEALPIX_PAD_XY pixel order, with ERA5-compatible
+    variables.
 
     Parameters
     ----------

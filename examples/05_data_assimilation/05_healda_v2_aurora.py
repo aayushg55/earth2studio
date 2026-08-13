@@ -33,6 +33,7 @@ In this example you will learn:
 - How a prognostic model's latitude grid is matched without hand-written slicing
 - Rolling Aurora forward from an observation-only initialization
 """
+
 # /// script
 # dependencies = [
 #   "earth2studio[da-healda-v2,aurora] @ git+https://github.com/NVIDIA/earth2studio.git",
