@@ -24,6 +24,7 @@ import xarray as xr
 
 from earth2studio.models.da.healda import E2S_CHANNELS
 from earth2studio.models.da.healda_v2 import (
+    _FP_COLS,
     IR_PCA_SENSORS,
     MW_SENSORS,
     N_WINDOW,
@@ -31,7 +32,6 @@ from earth2studio.models.da.healda_v2 import (
     _choose_model_parallel_size,
     _ContextParallelRotaryEmbedding,
     _factorize_footprints,
-    _FP_COLS,
     _random_benchmark_assets,
 )
 from earth2studio.models.da.healda_v2_utils import (

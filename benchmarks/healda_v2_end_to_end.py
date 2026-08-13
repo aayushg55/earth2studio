@@ -198,9 +198,11 @@ def main() -> None:
     os.environ["EARTH2STUDIO_CACHE"] = args.cache_dir
     load_start = time.perf_counter()
     model = HealDAv2.load_model(
-        package=Package(args.package, cache_options={"same_names": True})
-        if args.package
-        else None,
+        package=(
+            Package(args.package, cache_options={"same_names": True})
+            if args.package
+            else None
+        ),
         model_parallel_size=args.model_parallel_size,
     )
     load_wall = time.perf_counter() - load_start

@@ -43,12 +43,6 @@ from earth2studio.data.utils import (
 )
 from earth2studio.lexicon import GSIConventionalLexicon, GSISatelliteLexicon
 from earth2studio.utils.time import normalize_time_tolerance
-from earth2studio.utils.timing import (
-    cpu_timing_drain,
-    cpu_timing_merge,
-    cpu_timing_range,
-    cpu_timing_reset,
-)
 from earth2studio.utils.type import TimeArray, TimeTolerance, VariableArray
 
 
@@ -92,8 +86,7 @@ def _decode_gsi_group(
     so it takes the source class rather than an instance and the tasks must arrive
     without their modifiers.
     """
-    with cpu_timing_range("ufs.h5_open"):
-        ds = h5netcdf.File(local_path, "r")
+    ds = h5netcdf.File(local_path, "r")
     try:
         data: dict[str, pa.Array] = {}
         channel_index_raw: np.ndarray | None = None
@@ -103,66 +96,56 @@ def _decode_gsi_group(
             # Skip channel-indexed fields; they are expanded below
             if name in channel_indexed_fields:
                 continue
-            with cpu_timing_range("ufs.h5_read"):
-                values = np.asarray(dset[:])
+            values = np.asarray(dset[:])
             pa_type = source_cls.SCHEMA.field(column_map.get(name, "observation")).type
             # Convert char arrays into strings for DF
             if values.dtype.kind == "S" and values.ndim == 2:
-                with cpu_timing_range("ufs.string_decode"):
-                    values = values.view(f"S{values.shape[1]}").ravel()
-                    values = np.char.rstrip(np.char.decode(values, "utf-8"), "\x00")
+                values = values.view(f"S{values.shape[1]}").ravel()
+                values = np.char.rstrip(np.char.decode(values, "utf-8"), "\x00")
             # Apply subclass-specific transformations
-            with cpu_timing_range("ufs.transform_column"):
-                values = source_cls._transform_column(name, values, tasks[0], ds)
-            with cpu_timing_range("ufs.pa_array"):
-                data[name] = pa.array(values, type=pa_type)
+            values = source_cls._transform_column(name, values, tasks[0], ds)
+            data[name] = pa.array(values, type=pa_type)
             # Stash raw Channel_Index for per-channel expansion
             if name == "Channel_Index":
-                with cpu_timing_range("ufs.h5_read"):
-                    channel_index_raw = np.asarray(dset[:])
+                channel_index_raw = np.asarray(dset[:])
 
         # Expand channel-indexed fields using Channel_Index as lookup
         if channel_index_raw is not None:
-            with cpu_timing_range("ufs.channel_index_expand"):
-                idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
-                for gsi_name, field_name in channel_indexed_fields.items():
-                    if gsi_name in ds.variables:
-                        lut = np.asarray(
-                            ds[gsi_name][:],
-                            dtype=schema.field(field_name).type.to_pandas_dtype(),
-                        )
-                        data[gsi_name] = pa.array(
-                            lut[idx], type=schema.field(field_name).type
-                        )
+            idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
+            for gsi_name, field_name in channel_indexed_fields.items():
+                if gsi_name in ds.variables:
+                    lut = np.asarray(
+                        ds[gsi_name][:],
+                        dtype=schema.field(field_name).type.to_pandas_dtype(),
+                    )
+                    data[gsi_name] = pa.array(
+                        lut[idx], type=schema.field(field_name).type
+                    )
     finally:
-        with cpu_timing_range("ufs.h5_close"):
-            ds.close()
+        ds.close()
 
     frames: list[pd.DataFrame] = []
     for task in tasks:
-        with cpu_timing_range("ufs.dataframe"):
-            df = pd.DataFrame(
-                {
-                    name: values
-                    for name, values in data.items()
-                    if name in column_map or name == task.gsi_obs_name
-                }
-            )
-        with cpu_timing_range("ufs.add_columns"):
-            df.rename(
-                columns={**column_map, task.gsi_obs_name: "observation"},
-                inplace=True,
-            )
-            # Add e2s columns
-            df["variable"] = task.e2s_obs_name
-            df.attrs["source"] = source_cls.SOURCE_ID
-            source_cls._add_task_columns(df, task)
+        df = pd.DataFrame(
+            {
+                name: values
+                for name, values in data.items()
+                if name in column_map or name == task.gsi_obs_name
+            }
+        )
+        df.rename(
+            columns={**column_map, task.gsi_obs_name: "observation"},
+            inplace=True,
+        )
+        # Add e2s columns
+        df["variable"] = task.e2s_obs_name
+        df.attrs["source"] = source_cls.SOURCE_ID
+        source_cls._add_task_columns(df, task)
 
-        with cpu_timing_range("ufs.time_filter"):
-            # Half-open (min, max] so adjacent request windows tile without
-            # double-counting observations on a cycle boundary
-            mask = (df["time"] > task.datetime_min) & (df["time"] <= task.datetime_max)
-            frames.append(df.loc[mask])
+        # Half-open (min, max] so adjacent request windows tile without
+        # double-counting observations on a cycle boundary
+        mask = (df["time"] > task.datetime_min) & (df["time"] <= task.datetime_max)
+        frames.append(df.loc[mask])
     return frames
 
 
@@ -182,16 +165,24 @@ def _init_gsi_worker(
         column_map=column_map,
         channel_indexed_fields=channel_indexed_fields,
     )
-    # A forked worker inherits whatever the parent had already accumulated, which
-    # would come back once per worker on the first drain
-    cpu_timing_reset()
+
+
+def _apply_modifiers(
+    tasks: list[_GSIAsyncTask], frames: list[pd.DataFrame]
+) -> list[pd.DataFrame]:
+    """Apply each task's modifier to its frame, in the parent process."""
+    modified = []
+    for task, df in zip(tasks, frames):
+        assert task.gsi_modifier is not None  # noqa: S101  # only worker copies drop it
+        modified.append(task.gsi_modifier(df))
+    return modified
 
 
 def _gsi_decode_worker(
     local_path: str, obs_names: set[str], tasks: list[_GSIAsyncTask]
-) -> tuple[list[pd.DataFrame], dict[str, tuple[float, int]]]:
-    """Decode one diag file and return its frames with this worker's timings."""
-    frames = _decode_gsi_group(
+) -> list[pd.DataFrame]:
+    """Decode one diag file with the context stashed by the worker initializer."""
+    return _decode_gsi_group(
         _GSI_WORKER["source_cls"],
         _GSI_WORKER["schema"],
         _GSI_WORKER["column_map"],
@@ -200,7 +191,6 @@ def _gsi_decode_worker(
         obs_names,
         tasks,
     )
-    return frames, cpu_timing_drain()
 
 
 def _hours_since_to_datetime(values: np.ndarray, origin: datetime) -> np.ndarray:
@@ -293,20 +283,17 @@ class _UFSObsBase:
         fields: str | list[str] | pa.Schema | None = None,
     ) -> pd.DataFrame:
         """Async function to get data."""
-        with cpu_timing_range("ufs.request_setup"):
-            time_list, variable_list = prep_data_inputs(time, variable)
-            self._validate_time(time_list)
-            schema = self.resolve_fields(fields)
-            pathlib.Path(self.cache).mkdir(parents=True, exist_ok=True)
+        time_list, variable_list = prep_data_inputs(time, variable)
+        self._validate_time(time_list)
+        schema = self.resolve_fields(fields)
+        pathlib.Path(self.cache).mkdir(parents=True, exist_ok=True)
 
-        with cpu_timing_range("ufs.create_tasks"):
-            async_tasks = self._create_tasks(time_list, variable_list)
-            file_key_set = {task.gsi_obs_key for task in async_tasks}
-            fetch_jobs = [self._fetch_remote_file(key) for key in file_key_set]
-        with cpu_timing_range("ufs.fetch_files"):
-            await tqdm.gather(
-                *fetch_jobs, desc="Fetching GSI files", disable=(not self._verbose)
-            )
+        async_tasks = self._create_tasks(time_list, variable_list)
+        file_key_set = {task.gsi_obs_key for task in async_tasks}
+        fetch_jobs = [self._fetch_remote_file(key) for key in file_key_set]
+        await tqdm.gather(
+            *fetch_jobs, desc="Fetching GSI files", disable=(not self._verbose)
+        )
 
         df = self._compile_dataframe(async_tasks, variable_list, schema)
 
@@ -440,11 +427,7 @@ class _UFSObsBase:
                     for (path, names, _group), spec in zip(groups, specs)
                 ]
                 for (_path, _names, group), future in zip(groups, futures):
-                    group_frames, timings = future.result()
-                    cpu_timing_merge(timings)
-                    for task, df in zip(group, group_frames):
-                        with cpu_timing_range("ufs.modifier"):
-                            frames.append(task.gsi_modifier(df))
+                    frames.extend(_apply_modifiers(group, future.result()))
         else:
             for local_path, obs_names, group in groups:
                 group_frames = _decode_gsi_group(
@@ -456,14 +439,10 @@ class _UFSObsBase:
                     obs_names,
                     group,
                 )
-                for task, df in zip(group, group_frames):
-                    with cpu_timing_range("ufs.modifier"):
-                        frames.append(task.gsi_modifier(df))
+                frames.extend(_apply_modifiers(group, group_frames))
 
-        with cpu_timing_range("ufs.concat"):
-            result = pd.concat(frames, ignore_index=True)
-        with cpu_timing_range("ufs.select_columns"):
-            return result[[name for name in schema.names if name in result.columns]]
+        result = pd.concat(frames, ignore_index=True)
+        return result[[name for name in schema.names if name in result.columns]]
 
     def _build_column_map(self, schema: pa.Schema) -> dict[str, str]:
         """Build mapping from GSI column names to schema column names."""

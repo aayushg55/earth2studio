@@ -22,11 +22,6 @@ import os
 import time
 from pathlib import Path
 
-os.environ.pop("AWS_PROFILE", None)
-os.environ.pop("AWS_DEFAULT_PROFILE", None)
-os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-os.environ["EARTH2STUDIO_CPU_TIMING"] = "1"
-
 import numpy as np
 
 import earth2studio
@@ -40,7 +35,6 @@ from earth2studio.models.da.healda_v2 import (
     WINDOW_STEP_HOURS,
 )
 from earth2studio.models.da.healda_v2_utils import CONV_REQUEST_VARIABLES
-from earth2studio.utils.timing import cpu_timing_report, cpu_timing_reset
 
 CONV_FIELDS = np.array(
     ["time", "lat", "lon", "observation", "variable", "type", "elev", "pres"]
@@ -87,7 +81,6 @@ def fetch_one(
     rows: list[dict],
 ) -> None:
     hits, keys = cache_hits(source, analysis_time, variables)
-    cpu_timing_reset()
     start = time.perf_counter()
     frame = fetch_dataframe(
         source,
@@ -96,14 +89,6 @@ def fetch_one(
         fields=fields,
     )
     wall = time.perf_counter() - start
-    report = cpu_timing_report()
-    transform_ms = 0.0
-    h5_ms = 0.0
-    for line in report.splitlines():
-        if line.strip().startswith("ufs.transform_column"):
-            transform_ms = float(line.split("total")[1].split("ms")[0])
-        if line.strip().startswith("ufs.h5_read"):
-            h5_ms = float(line.split("total")[1].split("ms")[0])
     rows.append(
         {
             "name": name,
@@ -111,30 +96,24 @@ def fetch_one(
             "cache": f"{hits}/{keys}",
             "obs": len(frame),
             "wall_s": wall,
-            "transform_s": transform_ms / 1e3,
-            "h5_s": h5_ms / 1e3,
         }
     )
     print(
-        f"\n{name}: cache={hits}/{keys}, rows={len(frame):,}, wall={wall:.3f}s "
-        f"(transform={transform_ms/1e3:.3f}s, h5={h5_ms/1e3:.3f}s)",
+        f"\n{name}: cache={hits}/{keys}, rows={len(frame):,}, wall={wall:.3f}s",
         flush=True,
     )
-    print(report, flush=True)
 
 
 def print_summary(label: str, rows: list[dict]) -> None:
     print(f"\n===== SUMMARY {label} =====", flush=True)
     print(
-        f"{'source':<6} {'analysis':<20} {'cache':>8} {'obs':>12} "
-        f"{'wall_s':>8} {'xform_s':>8} {'h5_s':>8}",
+        f"{'source':<6} {'analysis':<20} {'cache':>8} {'obs':>12} {'wall_s':>8}",
         flush=True,
     )
     for row in rows:
         print(
             f"{row['name']:<6} {row['analysis']:<20} {row['cache']:>8} "
-            f"{row['obs']:>12,} {row['wall_s']:>8.3f} "
-            f"{row['transform_s']:>8.3f} {row['h5_s']:>8.3f}",
+            f"{row['obs']:>12,} {row['wall_s']:>8.3f}",
             flush=True,
         )
     total_wall = sum(r["wall_s"] for r in rows)
