@@ -234,7 +234,9 @@ lon = coords["lon"]
 era5_analysis = NCAR_ERA5()(analysis_time, score_vars).interp(
     lat=lat, lon=lon, method="nearest"
 )
-era5_valid = NCAR_ERA5()(valid_time, score_vars).interp(lat=lat, lon=lon, method="nearest")
+era5_valid = NCAR_ERA5()(valid_time, score_vars).interp(
+    lat=lat, lon=lon, method="nearest"
+)
 
 
 def to_numpy(arr):
@@ -275,7 +277,12 @@ for row, var in enumerate(plot_vars):
     panels = [
         (f"FCN3 +{lead_hours} h", predicted, cmaps[row], None),
         ("ERA5", truth, cmaps[row], None),
-        (f"difference, rmse {rmse(predicted, truth, lat):.3g}", difference, "RdBu_r", scale),
+        (
+            f"difference, rmse {rmse(predicted, truth, lat):.3g}",
+            difference,
+            "RdBu_r",
+            scale,
+        ),
     ]
     for col, (label, field, cmap, limit) in enumerate(panels):
         ax = axes[row, col]

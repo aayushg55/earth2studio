@@ -224,7 +224,9 @@ cmaps = ["Spectral_r", "viridis"]
 lat = coords["lat"]
 lon = coords["lon"]
 
-era5_valid = NCAR_ERA5()(valid_time, score_vars).interp(lat=lat, lon=lon, method="nearest")
+era5_valid = NCAR_ERA5()(valid_time, score_vars).interp(
+    lat=lat, lon=lon, method="nearest"
+)
 # The analysis keeps its own 721-row grid, so score it there rather than on Aurora's.
 analysis_lat = analyses[-1].coords["lat"].values
 era5_init = NCAR_ERA5()(init_time, score_vars).interp(
