@@ -118,8 +118,11 @@ SENSOR_PLATFORMS: dict[str, list[str]] = {
     "airs-pca": ["aqua"],
 }
 
-# Footprint identity columns for grouping long-format IR rows into soundings
-_FP_COLS = ["satellite", "time", "lat", "lon", "scan_angle", "satellite_za", "solza"]
+# Footprint identity columns for grouping long-format IR rows into soundings. `satellite`
+# is not one: a row only has to differ from its neighbour, and one platform's rows arrive in
+# a contiguous block, so two platforms meet only at a block boundary, where the time and
+# position differ anyway. Comparing it as strings costs 8x these six columns together.
+_FP_COLS = ["time", "lat", "lon", "scan_angle", "satellite_za", "solza"]
 
 # Base conv local channel -> platform id, gathered instead of a per-row lookup.
 _CONV_CHANNEL_PLATFORM_ID = np.array(
@@ -352,19 +355,6 @@ def _obs_frame(data: dict) -> pd.DataFrame:
     return pd.DataFrame(data).astype(_OBS_FRAME_DTYPES, copy=False)
 
 
-def _identity_values(column: pd.Series) -> np.ndarray:
-    """One identity column as a numeric array that compares elementwise.
-
-    Strings go through codes, because comparing an object array compares one
-    Python object at a time.
-    """
-    if isinstance(column.dtype, pd.CategoricalDtype):
-        return column.cat.codes.to_numpy()
-    if column.dtype == object:
-        return pd.factorize(column.to_numpy(), use_na_sentinel=False)[0]
-    return column.to_numpy()
-
-
 def _factorize_footprints(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
     """Footprint ids for long-format IR rows, numbered in order of appearance.
 
@@ -377,13 +367,13 @@ def _factorize_footprints(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
     if n < 2:
         return np.zeros(n, dtype=np.int64)
 
+    # changed[i]: row i + 1 differs from row i in at least one identity column
     changed = np.zeros(n - 1, dtype=bool)
     for col in cols:
-        values = _identity_values(df[col])
+        values = df[col].to_numpy()
         np.logical_or(changed, values[1:] != values[:-1], out=changed)
 
-    footprint_id = np.empty(n, dtype=np.int64)
-    footprint_id[0] = 0
+    footprint_id = np.zeros(n, dtype=np.int64)
     np.cumsum(changed, dtype=np.int64, out=footprint_id[1:])
     return footprint_id
 
@@ -406,7 +396,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     The model accepts observation DataFrames (from
     :py:class:`earth2studio.data.UFSObsConv` and
     :py:class:`earth2studio.data.UFSObsSat`) and produces a global analysis on
-    the HEALPix level-6 padded XY grid with ERA5-compatible variables.
+    the HEALPix level-6 HEALPIX_PAD_XY pixel order with ERA5-compatible variables.
 
     Parameters
     ----------
@@ -441,7 +431,8 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
     lat_lon : bool, optional
         If True the model output is regridded from the native HEALPix grid to a
         regular equiangular lat-lon grid using ``earth2grid``. If False the raw
-        HEALPix output is returned with an ``npix`` dimension, by default False
+        HEALPix output is returned with an ``npix`` dimension in
+        ``earth2grid.healpix.HEALPIX_PAD_XY`` pixel order, by default False
     output_resolution : tuple[int, int], optional
         ``(nlat, nlon)`` size of the output lat-lon grid. Only used when
         ``lat_lon=True``, by default ``(181, 360)`` (1° resolution)
@@ -711,8 +702,9 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             Number of ranks splitting the 8-frame time axis. Uses the world
             size when omitted, by default None
         lat_lon : bool, optional
-            If True the output is regridded to a regular lat-lon grid,
-            by default False
+            If True the output is regridded to a regular lat-lon grid; if False
+            it stays on the native HEALPix level-6 grid in
+            ``earth2grid.healpix.HEALPIX_PAD_XY`` pixel order, by default False
         output_resolution : tuple[int, int], optional
             ``(nlat, nlon)`` size of the output lat-lon grid, reached in one
             bilinear step from the native HEALPix level-6 grid. Only used when
@@ -791,14 +783,17 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         if unknown_vars:
             raise ValueError(f"Unknown conventional variable(s): {unknown_vars}")
 
-        var_codes, var_uniques = pd.factorize(df["variable"].to_numpy(), sort=False)
-        var_lut = np.array([CONV_VAR_CHANNEL[v] for v in var_uniques], dtype=np.int64)
-        base_local = var_lut[var_codes]
+        # Through category codes, because the variable column holds one string
+        # object per row.
+        variable = df["variable"].astype("category")
+        var_lut = np.array(
+            [CONV_VAR_CHANNEL[v] for v in variable.cat.categories], dtype=np.int64
+        )
+        base_local = var_lut[variable.cat.codes.to_numpy()]
         observation = df["observation"].to_numpy().astype(np.float64)
         # Earth2Studio provides pressure-like values in Pa; the model was
         # trained on hPa.
-        is_pres_obs = df["variable"].to_numpy() == "pres"
-        observation[is_pres_obs] /= 100.0
+        observation[base_local == CONV_VAR_CHANNEL["pres"]] /= 100.0
         height = df["elev"].to_numpy().astype(np.float32)
         pressure = df["pres"].to_numpy().astype(np.float32) / np.float32(100.0)
         obs_type = df["type"].fillna(0).to_numpy().astype(np.int64)
@@ -833,12 +828,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         global_channel = SENSOR_OFFSET["conv-plevel"] + expanded_local
 
         platform = _CONV_CHANNEL_PLATFORM_ID[base_local]
-        df = df.loc[keep]
+        # Gathered per column, so the five columns this frame does not return are
+        # never copied.
         return _obs_frame(
             {
-                "lat": df["lat"].to_numpy().astype(np.float32),
-                "lon": df["lon"].to_numpy().astype(np.float32),
-                "obs_time_ns": df["time"].to_numpy().astype("datetime64[ns]"),
+                "lat": df["lat"].to_numpy()[keep].astype(np.float32),
+                "lon": df["lon"].to_numpy()[keep].astype(np.float32),
+                "obs_time_ns": df["time"].to_numpy()[keep].astype("datetime64[ns]"),
                 "observation": observation[keep],
                 "global_channel": global_channel,
                 "global_platform": platform,
@@ -993,29 +989,24 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         )
 
     def _frame_parts(
-        self, conv_df: pd.DataFrame | None, sat_df: pd.DataFrame | None
+        self,
+        conv_df: pd.DataFrame | None,
+        sat_by_variable: dict[str, pd.DataFrame],
     ) -> list[pd.DataFrame]:
         """Per-sensor preprocessed DataFrames for a single 6-hour frame."""
         parts: list[pd.DataFrame] = []
         if conv_df is not None and len(conv_df) > 0:
             parts.append(self.prep_conv(conv_df))
-        if sat_df is not None and len(sat_df) > 0:
-            # One pass partitions the frame by variable instead of a boolean
-            # scan per sensor.
-            by_variable = {
-                variable: rows
-                for variable, rows in sat_df.groupby("variable", sort=False)
-            }
-            for sensor in MW_SENSORS:
-                rows = by_variable.get(sensor)
-                if rows is not None and len(rows) > 0:
-                    parts.append(self.prep_mw(rows, sensor))
-            for sensor in IR_PCA_SENSORS:
-                if sensor not in self._codecs:
-                    continue
-                rows = by_variable.get(IR_PCA_UFS_VARIABLE[sensor])
-                if rows is not None and len(rows) > 0:
-                    parts.append(self.prep_ir_pca(rows, sensor))
+        for sensor in MW_SENSORS:
+            rows = sat_by_variable.get(sensor)
+            if rows is not None and len(rows) > 0:
+                parts.append(self.prep_mw(rows, sensor))
+        for sensor in IR_PCA_SENSORS:
+            if sensor not in self._codecs:
+                continue
+            rows = sat_by_variable.get(IR_PCA_UFS_VARIABLE[sensor])
+            if rows is not None and len(rows) > 0:
+                parts.append(self.prep_ir_pca(rows, sensor))
         return [part for part in parts if len(part) > 0]
 
     # ------------------------------------------------------------------
@@ -1043,27 +1034,66 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         return (lower - origin).to_timedelta64(), (upper - origin).to_timedelta64()
 
     @staticmethod
-    def _time_ns(df: pd.DataFrame | None) -> np.ndarray | None:
+    def _time_ns(df: pd.DataFrame) -> np.ndarray:
         """Observation times as int64 epoch ns, computed once per source."""
-        if df is None or len(df) == 0:
-            return None
         return df["time"].to_numpy().astype("datetime64[ns]").astype(np.int64)
 
     @staticmethod
-    def _slice_frame(
+    def _frame_of_row(
+        time_ns: np.ndarray, frame_times: list[pd.Timestamp]
+    ) -> np.ndarray:
+        """Frame each observation belongs to, or -1 for outside the window.
+
+        The frame windows are the contiguous bins ``(valid - 3h, valid + 3h]``, so
+        the bin is a floor division. Subtracting 1 ns puts each open left edge in
+        the bin below it.
+        """
+        start = (frame_times[0] - pd.Timedelta(hours=FRAME_CONTEXT_HOURS)).value
+        step = pd.Timedelta(hours=WINDOW_STEP_HOURS).value
+        frame = (time_ns - start - 1) // step
+        return np.where(
+            (time_ns > start) & (frame < len(frame_times)),
+            frame,
+            -1,
+        )
+
+    @classmethod
+    def _rows_by_frame(
+        cls,
         df: pd.DataFrame | None,
-        time_ns: np.ndarray | None,
-        valid_time: pd.Timestamp,
-    ) -> pd.DataFrame | None:
-        """Observations in the frame's end-aligned (valid - 3h, valid + 3h] window."""
-        if df is None or time_ns is None or len(df) == 0:
-            return None
-        lo = (valid_time - pd.Timedelta(hours=FRAME_CONTEXT_HOURS)).value
-        hi = (valid_time + pd.Timedelta(hours=FRAME_CONTEXT_HOURS)).value
-        mask = (time_ns > lo) & (time_ns <= hi)
-        if not mask.any():
-            return None
-        return df[mask]
+        frame_times: list[pd.Timestamp],
+    ) -> dict[int, pd.DataFrame]:
+        """Each frame's rows, gathered in one pass over the source."""
+        if df is None or len(df) == 0:
+            return {}
+        frame_of_row = cls._frame_of_row(cls._time_ns(df), frame_times)
+        return {
+            int(frame): rows
+            for frame, rows in df.groupby(frame_of_row, sort=False)
+            if frame >= 0
+        }
+
+    @classmethod
+    def _rows_by_frame_and_variable(
+        cls,
+        df: pd.DataFrame | None,
+        frame_times: list[pd.Timestamp],
+    ) -> dict[int, dict[str, pd.DataFrame]]:
+        """Each frame's rows split by variable, gathered in one pass.
+
+        Splitting on both keys at once copies the rows once, where a frame slice
+        followed by a variable split copies them twice.
+        """
+        if df is None or len(df) == 0:
+            return {}
+        frame_of_row = cls._frame_of_row(cls._time_ns(df), frame_times)
+        grouped: dict[int, dict[str, pd.DataFrame]] = {}
+        for (frame, variable), rows in df.groupby(
+            [frame_of_row, df["variable"]], sort=False
+        ):
+            if frame >= 0:
+                grouped.setdefault(int(frame), {})[variable] = rows
+        return grouped
 
     def filter_and_normalize(
         self,
@@ -1094,14 +1124,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             and ``target_sec`` columns; may be empty
         """
         frame_times = self._frame_valid_times(request_time)
-        conv_time_ns = self._time_ns(conv_obs)
-        sat_time_ns = self._time_ns(sat_obs)
+        conv_frames = self._rows_by_frame(conv_obs, frame_times)
+        sat_frames = self._rows_by_frame_and_variable(sat_obs, frame_times)
         parts: list[pd.DataFrame] = []
         for frame_idx, valid_time in enumerate(frame_times):
-            frame_conv = self._slice_frame(conv_obs, conv_time_ns, valid_time)
-            frame_sat = self._slice_frame(sat_obs, sat_time_ns, valid_time)
-            for part in self._frame_parts(frame_conv, frame_sat):
-                part = part.copy()
+            for part in self._frame_parts(
+                conv_frames.get(frame_idx), sat_frames.get(frame_idx, {})
+            ):
                 part["frame"] = np.int64(frame_idx)
                 part["target_sec"] = np.int64(self._datetime64_to_epoch_sec(valid_time))
                 parts.append(part)
