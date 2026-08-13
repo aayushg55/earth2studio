@@ -53,14 +53,17 @@ In this example you will learn:
 #   :py:class:`earth2studio.data.UFSObsSat`.
 # - Datasource (verification): ERA5 :py:class:`earth2studio.data.NCAR_ERA5`.
 #
-# The model package holds the weights and the preprocessing artifacts they were
-# trained with: the static conditioning fields, the observation statistics, and the
-# PCA codecs for the infrared sounders. Point ``HEALDA_V2_PACKAGE`` at it, as a
-# directory or any fsspec URI, or construct a
-# :py:class:`earth2studio.models.auto.Package` yourself.
+# Set ``HEALDA_V2_PACKAGE`` to the HealDA-v2 package before running::
+#
+#     export HEALDA_V2_PACKAGE=/path/to/e2s-healda-v2
+#
+# The package holds the weights and the artifacts they were trained with: the static
+# conditioning fields, the observation statistics, and the PCA codecs for the infrared
+# sounders. Any fsspec URI works in place of a local directory.
 
 # %%
 import os
+import sys
 
 os.makedirs("outputs", exist_ok=True)
 from dotenv import load_dotenv
@@ -72,8 +75,15 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
+# The model broadcasts the finished analysis to every rank, so under torchrun rank 0
+# narrates and the other ranks report only failures.
+rank = int(os.environ.get("RANK", 0))
 logger.remove()
-logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
+logger.add(
+    lambda msg: tqdm.write(msg, end=""),
+    colorize=True,
+    level="INFO" if rank == 0 else "WARNING",
+)
 
 from earth2studio.data import NCAR_ERA5, UFSObsConv, UFSObsSat, fetch_dataframe
 from earth2studio.models.da import HealDAv2
@@ -145,8 +155,14 @@ result_conv = model(conv_obs=conv_df)
 # ---------------
 # The output is already on the requested lat-lon grid. Compare the three runs for
 # 2 m temperature and 500 hPa geopotential.
+#
+# Every rank holds the same analysis, so verification and plotting are rank 0's alone;
+# running them everywhere would race on the ERA5 cache and on the output files.
 
 # %%
+if rank != 0:
+    sys.exit(0)
+
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
@@ -176,11 +192,11 @@ def to_numpy(arr):
 for row, (title, da) in enumerate(zip(titles, results)):
     for col, var in enumerate(plot_vars):
         ax = axes[row, col]
-        im = ax.pcolormesh(
-            lon,
-            lat,
+        im = ax.imshow(
             to_numpy(da.sel(variable=var).data[0]),
             transform=ccrs.PlateCarree(),
+            extent=[lon[0], lon[0] + 360, lat[-1], lat[0]],
+            origin="upper",
             cmap=cmaps[col],
         )
         ax.coastlines(linewidth=0.5)
@@ -215,8 +231,25 @@ plt.savefig("outputs/23_healda_v2_analysis.jpg", dpi=150)
 # same grid.
 
 # %%
-era5 = NCAR_ERA5()(analysis_time, plot_vars)
+score_vars = ["t2m", "u10m", "t850", "u500", "z500", "q700"]
+era5 = NCAR_ERA5()(analysis_time, score_vars)
 era5 = era5.interp(lat=lat, lon=lon, method="nearest")
+
+
+def rmse(prediction, truth, latitudes):
+    """Latitude-weighted root mean square error, cells weighted by cos(lat)."""
+    weights = np.broadcast_to(np.cos(np.deg2rad(latitudes))[:, None], truth.shape)
+    return float(np.sqrt(np.average((prediction - truth) ** 2, weights=weights)))
+
+
+logger.info(f"{'variable':>9}  {'analysis rmse':>14}")
+for var in score_vars:
+    error = rmse(
+        to_numpy(result_both.sel(variable=var).data[0]),
+        to_numpy(era5.sel(variable=var).data[0]),
+        lat,
+    )
+    logger.info(f"{var:>9}  {error:14.4g}")
 
 plt.close("all")
 fig, axes = plt.subplots(
@@ -235,7 +268,7 @@ for row, var in enumerate(plot_vars):
         ("HealDA-v2", analysis, cmaps[row], None),
         ("ERA5", truth, cmaps[row], None),
         (
-            f"difference, rmse {np.sqrt((difference**2).mean()):.3g}",
+            f"difference, rmse {rmse(analysis, truth, lat):.3g}",
             difference,
             "RdBu_r",
             scale,
@@ -243,11 +276,11 @@ for row, var in enumerate(plot_vars):
     ]
     for col, (label, field, cmap, limit) in enumerate(panels):
         ax = axes[row, col]
-        im = ax.pcolormesh(
-            lon,
-            lat,
+        im = ax.imshow(
             field,
             transform=ccrs.PlateCarree(),
+            extent=[lon[0], lon[0] + 360, lat[-1], lat[0]],
+            origin="upper",
             cmap=cmap,
             vmin=None if limit is None else -limit,
             vmax=limit,

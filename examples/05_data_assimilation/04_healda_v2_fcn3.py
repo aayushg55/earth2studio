@@ -54,8 +54,13 @@ In this example you will learn:
 #   :py:class:`earth2studio.data.UFSObsSat`.
 # - Datasource (verification): ERA5 :py:class:`earth2studio.data.NCAR_ERA5`.
 #
-# See :ref:`sphx_glr_examples_05_data_assimilation_03_healda_v2.py` for the
-# assimilation on its own, including how to point ``HEALDA_V2_PACKAGE`` at a package.
+# Set ``HEALDA_V2_PACKAGE`` to the HealDA-v2 package before running::
+#
+#     export HEALDA_V2_PACKAGE=/path/to/e2s-healda-v2
+#
+# Any fsspec URI works in place of a local directory. See
+# :ref:`sphx_glr_examples_05_data_assimilation_03_healda_v2.py` for the assimilation on
+# its own.
 #
 # FourCastNet 3 needs torch-harmonics and makani installed from source before its extra
 # resolves; the install guide's FourCastNet 3 tab gives the commands.
@@ -64,6 +69,7 @@ In this example you will learn:
 import os
 
 os.makedirs("outputs", exist_ok=True)
+import sys
 import time
 from collections import OrderedDict
 
@@ -76,8 +82,15 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
+# The DA model broadcasts the finished analysis to every rank, so under torchrun rank 0
+# narrates and the other ranks report only failures.
+rank = int(os.environ.get("RANK", 0))
 logger.remove()
-logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
+logger.add(
+    lambda msg: tqdm.write(msg, end=""),
+    colorize=True,
+    level="INFO" if rank == 0 else "WARNING",
+)
 
 from earth2studio.data import NCAR_ERA5, UFSObsConv, UFSObsSat, fetch_dataframe
 from earth2studio.data.utils import prep_data_array
@@ -201,18 +214,27 @@ valid_time = analysis_time + lead_24h
 # Verify Against ERA5
 # -------------------
 # ERA5 at the forecast's valid time, on the same grid and the same variable names.
+#
+# Every rank holds the same analysis and forecast, so scoring and plotting are rank 0's
+# alone; running them everywhere would race on the ERA5 cache and on the output files.
 
 # %%
+if rank != 0:
+    sys.exit(0)
+
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
 
-plot_vars = ["t2m", "z500", "u500", "q700"]
-cmaps = ["Spectral_r", "viridis", "RdBu_r", "viridis"]
+score_vars = ["t2m", "u10m", "t850", "u500", "z500", "q700"]
+plot_vars = ["t2m", "z500"]
+cmaps = ["Spectral_r", "viridis"]
 lat = coords["lat"]
 lon = coords["lon"]
 
-era5 = NCAR_ERA5()(valid_time, plot_vars)
-era5 = era5.interp(lat=lat, lon=lon, method="nearest")
+era5_analysis = NCAR_ERA5()(analysis_time, score_vars).interp(
+    lat=lat, lon=lon, method="nearest"
+)
+era5_valid = NCAR_ERA5()(valid_time, score_vars).interp(lat=lat, lon=lon, method="nearest")
 
 
 def to_numpy(arr):
@@ -220,31 +242,43 @@ def to_numpy(arr):
     return arr.get() if hasattr(arr, "get") else arr
 
 
-plt.close("all")
-fig, axes = plt.subplots(
-    len(plot_vars), 3, subplot_kw={"projection": ccrs.Robinson()}, figsize=(18, 14)
-)
+def rmse(prediction, truth, latitudes):
+    """Latitude-weighted root mean square error, cells weighted by cos(lat)."""
+    weights = np.broadcast_to(np.cos(np.deg2rad(latitudes))[:, None], truth.shape)
+    return float(np.sqrt(np.average((prediction - truth) ** 2, weights=weights)))
+
 
 variables = list(coords["variable"])
+logger.info(f"{'variable':>9}  {'analysis':>10}  {'+' + str(lead_hours) + ' h':>10}")
+for var in score_vars:
+    analysis_error = rmse(
+        to_numpy(analysis.sel(variable=var).data[0]),
+        to_numpy(era5_analysis.sel(variable=var).data[0]),
+        lat,
+    )
+    forecast_error = rmse(
+        forecast[lead_24h][0, 0, variables.index(var)].cpu().numpy(),
+        to_numpy(era5_valid.sel(variable=var).data[0]),
+        lat,
+    )
+    logger.info(f"{var:>9}  {analysis_error:10.4g}  {forecast_error:10.4g}")
+
+plt.close("all")
+fig, axes = plt.subplots(
+    len(plot_vars), 3, subplot_kw={"projection": ccrs.Robinson()}, figsize=(18, 7)
+)
 for row, var in enumerate(plot_vars):
     predicted = forecast[lead_24h][0, 0, variables.index(var)].cpu().numpy()
-    truth = to_numpy(era5.sel(variable=var).data[0])
+    truth = to_numpy(era5_valid.sel(variable=var).data[0])
     difference = predicted - truth
     scale = np.abs(difference).max()
     panels = [
         (f"FCN3 +{lead_hours} h", predicted, cmaps[row], None),
         ("ERA5", truth, cmaps[row], None),
-        (
-            f"difference, rmse {np.sqrt((difference**2).mean()):.3g}",
-            difference,
-            "RdBu_r",
-            scale,
-        ),
+        (f"difference, rmse {rmse(predicted, truth, lat):.3g}", difference, "RdBu_r", scale),
     ]
     for col, (label, field, cmap, limit) in enumerate(panels):
         ax = axes[row, col]
-        # Rasterized warp, 15x cheaper than pcolormesh at this resolution. The extent
-        # spans a full 360 degrees or a seam opens at the prime meridian.
         im = ax.imshow(
             field,
             transform=ccrs.PlateCarree(),
