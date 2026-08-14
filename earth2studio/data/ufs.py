@@ -22,8 +22,10 @@ import pathlib
 import shutil
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from typing import Any
 
 import h5netcdf
 import numpy as np
@@ -52,10 +54,156 @@ class _GSIAsyncTask:
     datetime_max: datetime
     datetime_min: datetime
     gsi_obs_key: str
-    gsi_modifier: Callable
+    # None on the copies handed to decode workers; modifiers are closures and are
+    # applied in the parent process
+    gsi_modifier: Callable | None
     gsi_obs_name: str
     e2s_obs_name: str
     satellite: str | None = None
+
+
+_NS_PER_HOUR = np.int64(3_600_000_000_000)
+
+CYCLE_HOURS = 6
+
+# Below this many diag files a process pool costs more than it saves
+_MIN_PARALLEL_FILES = 4
+
+
+def _decode_gsi_group(
+    source_cls: type[_UFSObsBase],
+    schema: pa.Schema,
+    column_map: dict[str, str],
+    channel_indexed_fields: dict[str, str],
+    local_path: str,
+    obs_names: set[str],
+    tasks: list[_GSIAsyncTask],
+) -> list[pd.DataFrame]:
+    """Decode one diag file into a DataFrame per task.
+
+    Tasks in a group share every column but the one supplying ``observation``, so
+    the file is read once and the obs columns fanned out. Runs in a worker process,
+    so it takes the source class rather than an instance and the tasks must arrive
+    without their modifiers.
+    """
+    ds = h5netcdf.File(local_path, "r")
+    try:
+        data: dict[str, pa.Array] = {}
+        channel_index_raw: np.ndarray | None = None
+        for name, dset in ds.variables.items():
+            if name not in column_map and name not in obs_names:
+                continue
+            # Skip channel-indexed fields; they are expanded below
+            if name in channel_indexed_fields:
+                continue
+            values = np.asarray(dset[:])
+            pa_type = source_cls.SCHEMA.field(column_map.get(name, "observation")).type
+            # Convert char arrays into strings for DF
+            if values.dtype.kind == "S" and values.ndim == 2:
+                values = values.view(f"S{values.shape[1]}").ravel()
+                values = np.char.rstrip(np.char.decode(values, "utf-8"), "\x00")
+            # Apply subclass-specific transformations
+            values = source_cls._transform_column(name, values, tasks[0], ds)
+            data[name] = pa.array(values, type=pa_type)
+            # Stash raw Channel_Index for per-channel expansion
+            if name == "Channel_Index":
+                channel_index_raw = np.asarray(dset[:])
+
+        # Expand channel-indexed fields using Channel_Index as lookup
+        if channel_index_raw is not None:
+            idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
+            for gsi_name, field_name in channel_indexed_fields.items():
+                if gsi_name in ds.variables:
+                    lut = np.asarray(
+                        ds[gsi_name][:],
+                        dtype=schema.field(field_name).type.to_pandas_dtype(),
+                    )
+                    data[gsi_name] = pa.array(
+                        lut[idx], type=schema.field(field_name).type
+                    )
+    finally:
+        ds.close()
+
+    frames: list[pd.DataFrame] = []
+    for task in tasks:
+        df = pd.DataFrame(
+            {
+                name: values
+                for name, values in data.items()
+                if name in column_map or name == task.gsi_obs_name
+            }
+        )
+        df.rename(
+            columns={**column_map, task.gsi_obs_name: "observation"},
+            inplace=True,
+        )
+        # Add e2s columns
+        df["variable"] = task.e2s_obs_name
+        df.attrs["source"] = source_cls.SOURCE_ID
+        source_cls._add_task_columns(df, task)
+
+        # Half-open (min, max] so adjacent request windows tile without
+        # double-counting observations on a cycle boundary
+        mask = (df["time"] > task.datetime_min) & (df["time"] <= task.datetime_max)
+        frames.append(df.loc[mask])
+    return frames
+
+
+_GSI_WORKER: dict[str, Any] = {}
+
+
+def _init_gsi_worker(
+    source_cls: type[_UFSObsBase],
+    schema: pa.Schema,
+    column_map: dict[str, str],
+    channel_indexed_fields: dict[str, str],
+) -> None:
+    """Stash the per-fetch decode context once per worker process."""
+    _GSI_WORKER.update(
+        source_cls=source_cls,
+        schema=schema,
+        column_map=column_map,
+        channel_indexed_fields=channel_indexed_fields,
+    )
+
+
+def _apply_modifiers(
+    tasks: list[_GSIAsyncTask], frames: list[pd.DataFrame]
+) -> list[pd.DataFrame]:
+    """Apply each task's modifier to its frame, in the parent process."""
+    modified = []
+    for task, df in zip(tasks, frames):
+        assert task.gsi_modifier is not None  # noqa: S101  # only worker copies drop it
+        modified.append(task.gsi_modifier(df))
+    return modified
+
+
+def _gsi_decode_worker(
+    local_path: str, obs_names: set[str], tasks: list[_GSIAsyncTask]
+) -> list[pd.DataFrame]:
+    """Decode one diag file with the context stashed by the worker initializer."""
+    return _decode_gsi_group(
+        _GSI_WORKER["source_cls"],
+        _GSI_WORKER["schema"],
+        _GSI_WORKER["column_map"],
+        _GSI_WORKER["channel_indexed_fields"],
+        local_path,
+        obs_names,
+        tasks,
+    )
+
+
+def _hours_since_to_datetime(values: np.ndarray, origin: datetime) -> np.ndarray:
+    """Convert fractional hours since ``origin`` to ``datetime64[ns]``.
+
+    Bit-exact with ``pd.to_timedelta(values, unit="h") + origin``; the rounding
+    to 12 decimal places is what reproduces the pandas result.
+    """
+    hours: np.ndarray = values.astype(np.float64, copy=False)
+    whole_hours: np.ndarray = hours.astype(np.int64)
+    fractional_ns = (np.round(hours - whole_hours, 12) * _NS_PER_HOUR).astype(np.int64)
+    offset_ns = whole_hours * _NS_PER_HOUR + fractional_ns
+    return np.datetime64(origin, "ns") + offset_ns.astype("timedelta64[ns]")
 
 
 class _UFSObsBase:
@@ -68,11 +216,14 @@ class _UFSObsBase:
     UFS_BUCKET = "noaa-ufs-gefsv13replay-pds"
     SOURCE_ID: str  # To be defined by subclasses
     SCHEMA: pa.Schema  # To be defined by subclasses
+    # A GSI diag file is labelled by its synoptic cycle and spans cycle +- 3h
+    CYCLE_HALF_WIDTH = timedelta(hours=3)
 
     def __init__(
         self,
         time_tolerance: TimeTolerance = np.timedelta64(10, "m"),
         max_workers: int = 24,
+        decode_workers: int = 8,
         cache: bool = True,
         async_timeout: int = 600,
         verbose: bool = True,
@@ -81,6 +232,7 @@ class _UFSObsBase:
         self._verbose = verbose
         self._cache = cache
         self._max_workers = max_workers
+        self._decode_workers = max(1, decode_workers)
         self.async_timeout = async_timeout
         self._tmp_cache_hash: str | None = None
         # Anonymous obstore S3 store for the public NOAA UFS replay bucket.
@@ -153,6 +305,30 @@ class _UFSObsBase:
         """Create async tasks for fetching data. Must be implemented by subclasses."""
         raise NotImplementedError("Subclasses must implement _create_tasks.")
 
+    def _cycle_window(self, t: datetime) -> tuple[datetime, datetime]:
+        """Half-open observation window ``(t + lower, t + upper]`` for a request."""
+        return t + self._tolerance_lower, t + self._tolerance_upper
+
+    @classmethod
+    def _cycles(cls, tmin: datetime, tmax: datetime) -> list[datetime]:
+        """Cycles whose ``[T - 3h, T + 3h]`` coverage meets the window ``(tmin, tmax]``.
+
+        A cycle qualifies when ``tmin - 3h < T < tmax + 3h``. Windows that end on a
+        cycle edge therefore stop there: widening the request past the edge is what
+        pulls in the neighbouring file.
+        """
+        first = tmin - cls.CYCLE_HALF_WIDTH
+        day = first.replace(minute=0, second=0, microsecond=0)
+        # Round down to a synoptic label, then step past it since T must exceed `first`
+        day = day.replace(hour=(day.hour // CYCLE_HOURS) * CYCLE_HOURS)
+        day += timedelta(hours=CYCLE_HOURS)
+        last = tmax + cls.CYCLE_HALF_WIDTH
+        cycles = []
+        while day < last:
+            cycles.append(day)
+            day += timedelta(hours=CYCLE_HOURS)
+        return cycles
+
     async def _fetch_remote_file(
         self,
         key: str,
@@ -213,80 +389,57 @@ class _UFSObsBase:
                 gsi_name = field.metadata[b"gsi_name"].decode("utf-8")
                 channel_indexed_fields[gsi_name] = field.name
 
-        frames: list[pd.DataFrame] = []
-        for task in async_tasks:
-            # Overwrite obs column name (needed for uv)
-            column_map = self._build_column_map(schema)
-            column_map[task.gsi_obs_name] = "observation"
-            local_path = self.cache_path(task.gsi_obs_key)
+        column_map = self._build_column_map(schema)
+        groups: list[tuple[str, set[str], list[_GSIAsyncTask]]] = []
+        for group in self._group_tasks(async_tasks):
+            local_path = self.cache_path(group[0].gsi_obs_key)
             if not pathlib.Path(local_path).is_file():
                 logger.warning(
                     "Cached file missing for {}",
-                    f"s3://{self.UFS_BUCKET}/{task.gsi_obs_key}",
+                    f"s3://{self.UFS_BUCKET}/{group[0].gsi_obs_key}",
                 )
                 continue
-            try:
-                with h5netcdf.File(local_path, "r") as ds:
-                    data: dict[str, np.ndarray] = {}
-                    channel_index_raw: np.ndarray | None = None
-                    for name, dset in ds.variables.items():
-                        if name not in column_map:
-                            continue
-                        # Skip channel-indexed fields; they are expanded below
-                        if name in channel_indexed_fields:
-                            continue
-                        values = np.asarray(dset[:])
-                        pa_type = self.SCHEMA.field(column_map[name]).type
-                        # Convert char arrays into strings for DF
-                        if values.dtype.kind == "S" and values.ndim == 2:
-                            values = values.view(f"S{values.shape[1]}").ravel()
-                            values = np.char.rstrip(
-                                np.char.decode(values, "utf-8"), "\x00"
-                            )
-                        # Apply subclass-specific transformations
-                        values = self._transform_column(name, values, task, ds)
-                        data[name] = pa.array(values, type=pa_type)
-                        # Stash raw Channel_Index for per-channel expansion
-                        if name == "Channel_Index":
-                            channel_index_raw = np.asarray(dset[:])
+            groups.append((local_path, {t.gsi_obs_name for t in group}, group))
 
-                    # Expand channel-indexed fields using Channel_Index as lookup
-                    if channel_index_raw is not None:
-                        idx: np.ndarray = channel_index_raw.astype(np.int32) - 1
-                        for gsi_name, field_name in channel_indexed_fields.items():
-                            if gsi_name in ds.variables:
-                                lut = np.asarray(
-                                    ds[gsi_name][:],
-                                    dtype=schema.field(
-                                        field_name
-                                    ).type.to_pandas_dtype(),
-                                )
-                                data[gsi_name] = pa.array(
-                                    lut[idx], type=schema.field(field_name).type
-                                )
-
-                df = pd.DataFrame(data)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error("Failed to read {}: {}", local_path, exc)
-                raise exc
-
-            # Rename columns
-            df.rename(columns=column_map, inplace=True)
-            # Add e2s columns
-            df["variable"] = task.e2s_obs_name
-            df.attrs["source"] = self.SOURCE_ID
-            self._add_task_columns(df, task)
-
-            mask = (df["time"] >= task.datetime_min) & (df["time"] <= task.datetime_max)
-            df = df.loc[mask]
-            frames.append(task.gsi_modifier(df))
-
-        if not frames:
+        if not groups:
             logger.warning(
                 "No observation files were available for this request; "
                 "returning an empty DataFrame."
             )
             return schema.empty_table().to_pandas()
+
+        frames: list[pd.DataFrame] = []
+        parallel = self._decode_workers > 1 and len(groups) >= _MIN_PARALLEL_FILES
+        if parallel:
+            # Modifiers are closures, which cannot be pickled, so they stay here and
+            # the workers receive tasks stripped of them
+            specs = [
+                [replace(task, gsi_modifier=None) for task in group]
+                for _path, _names, group in groups
+            ]
+            with ProcessPoolExecutor(
+                max_workers=min(self._decode_workers, len(groups)),
+                initializer=_init_gsi_worker,
+                initargs=(type(self), schema, column_map, channel_indexed_fields),
+            ) as pool:
+                futures = [
+                    pool.submit(_gsi_decode_worker, path, names, spec)
+                    for (path, names, _group), spec in zip(groups, specs)
+                ]
+                for (_path, _names, group), future in zip(groups, futures):
+                    frames.extend(_apply_modifiers(group, future.result()))
+        else:
+            for local_path, obs_names, group in groups:
+                group_frames = _decode_gsi_group(
+                    type(self),
+                    schema,
+                    column_map,
+                    channel_indexed_fields,
+                    local_path,
+                    obs_names,
+                    group,
+                )
+                frames.extend(_apply_modifiers(group, group_frames))
 
         result = pd.concat(frames, ignore_index=True)
         return result[[name for name in schema.names if name in result.columns]]
@@ -303,8 +456,8 @@ class _UFSObsBase:
         column_map[time_field.metadata[b"gsi_name"].decode("utf-8")] = time_field.name
         return column_map
 
+    @staticmethod
     def _transform_column(
-        self,
         name: str,
         values: np.ndarray,
         task: _GSIAsyncTask,
@@ -313,9 +466,26 @@ class _UFSObsBase:
         """Transform column values. Must be implemented by subclasses."""
         raise NotImplementedError("Subclasses must implement _transform_column.")
 
-    def _add_task_columns(self, df: pd.DataFrame, task: _GSIAsyncTask) -> None:
+    @staticmethod
+    def _add_task_columns(df: pd.DataFrame, task: _GSIAsyncTask) -> None:
         """Add task-specific columns to DataFrame. Override in subclasses."""
         pass
+
+    @staticmethod
+    def _group_tasks(
+        async_tasks: list[_GSIAsyncTask],
+    ) -> list[list[_GSIAsyncTask]]:
+        """Group tasks reading the same file over the same window.
+
+        GSI packs several observed quantities into one file (u and v in
+        ``diag_conv_uv``, bending angle and level-2 retrievals in
+        ``diag_conv_gps``), which would otherwise be decoded once per variable.
+        """
+        groups: dict[tuple[str, datetime, datetime], list[_GSIAsyncTask]] = {}
+        for task in async_tasks:
+            key = (task.gsi_obs_key, task.datetime_min, task.datetime_max)
+            groups.setdefault(key, []).append(task)
+        return list(groups.values())
 
     @classmethod
     def resolve_fields(cls, fields: str | list[str] | pa.Schema | None) -> pa.Schema:
@@ -442,6 +612,9 @@ class UFSObsConv(_UFSObsBase):
         by default, np.timedelta64(10, 'm').
     max_workers : int, optional
         Max workers in async IO thread pool for concurrent downloads, by default 24.
+    decode_workers : int, optional
+        Worker processes used to decode cached diag files, by default 8. Set to 1 to
+        decode in the calling process.
     cache : bool, optional
         Cache data source in local filesystem cache, by default True.
     async_timeout : int, optional
@@ -529,11 +702,8 @@ class UFSObsConv(_UFSObsBase):
                 raise
 
             for t in time_list:
-                tmin = t + self._tolerance_lower
-                tmax = t + self._tolerance_upper
-                day = tmin.replace(minute=0, second=0, microsecond=0)
-                day = day.replace(hour=(day.hour // 6) * 6)
-                while day <= tmax:
+                tmin, tmax = self._cycle_window(t)
+                for day in self._cycles(tmin, tmax):
                     year_key = day.strftime("%Y")
                     month_key = day.strftime("%m")
                     datetime_key = day.strftime("%Y%m%d%H")
@@ -549,11 +719,10 @@ class UFSObsConv(_UFSObsBase):
                             e2s_obs_name=v,
                         )
                     )
-                    day = day + timedelta(hours=6)
         return tasks
 
+    @staticmethod
     def _transform_column(
-        self,
         name: str,
         values: np.ndarray,
         task: _GSIAsyncTask,
@@ -562,7 +731,7 @@ class UFSObsConv(_UFSObsBase):
         """Transform column values for conventional data."""
         # Convert hours offset to timedelta, and add to datetime of file
         if name == "Time":
-            values = pd.to_timedelta(values, unit="h") + task.datetime_file
+            values = _hours_since_to_datetime(values, task.datetime_file)
         # GSI stores Pressure in hPa (mb), convert to Pa
         elif name == "Pressure":
             values = values * 100.0
@@ -590,6 +759,9 @@ class UFSObsSat(_UFSObsBase):
         List of satellite platforms to include, by default includes all platforms.
     max_workers : int, optional
         Max workers in async IO thread pool for concurrent downloads, by default 24.
+    decode_workers : int, optional
+        Worker processes used to decode cached diag files, by default 8. Set to 1 to
+        decode in the calling process.
     cache : bool, optional
         Cache data source in local filesystem cache, by default True.
     async_timeout : int, optional
@@ -700,6 +872,7 @@ class UFSObsSat(_UFSObsBase):
         time_tolerance: TimeTolerance = np.timedelta64(10, "m"),
         satellites: list[str] | None = None,
         max_workers: int = 24,
+        decode_workers: int = 8,
         cache: bool = True,
         async_timeout: int = 600,
         verbose: bool = True,
@@ -717,6 +890,7 @@ class UFSObsSat(_UFSObsBase):
         super().__init__(
             time_tolerance=time_tolerance,
             max_workers=max_workers,
+            decode_workers=decode_workers,
             cache=cache,
             async_timeout=async_timeout,
             verbose=verbose,
@@ -744,11 +918,8 @@ class UFSObsSat(_UFSObsBase):
 
             for gsi_platform in gsi_platforms:
                 for t in time_list:
-                    tmin = t + self._tolerance_lower
-                    tmax = t + self._tolerance_upper
-                    day = tmin.replace(minute=0, second=0, microsecond=0)
-                    day = day.replace(hour=(day.hour // 6) * 6)
-                    while day <= tmax:
+                    tmin, tmax = self._cycle_window(t)
+                    for day in self._cycles(tmin, tmax):
                         year_key = day.strftime("%Y")
                         month_key = day.strftime("%m")
                         datetime_key = day.strftime("%Y%m%d%H")
@@ -765,7 +936,6 @@ class UFSObsSat(_UFSObsBase):
                                 satellite=gsi_platform,
                             )
                         )
-                        day = day + timedelta(hours=6)
         return tasks
 
     def _build_column_map(self, schema: pa.Schema) -> dict[str, str]:
@@ -780,8 +950,8 @@ class UFSObsSat(_UFSObsBase):
                 break
         return column_map
 
+    @staticmethod
     def _transform_column(
-        self,
         name: str,
         values: np.ndarray,
         task: _GSIAsyncTask,
@@ -790,9 +960,10 @@ class UFSObsSat(_UFSObsBase):
         """Transform column values for satellite data."""
         # Convert hours offset to timedelta, and add to datetime of file
         if name == "Obs_Time":
-            values = pd.to_timedelta(values, unit="h") + task.datetime_file
+            values = _hours_since_to_datetime(values, task.datetime_file)
         return values
 
-    def _add_task_columns(self, df: pd.DataFrame, task: _GSIAsyncTask) -> None:
+    @staticmethod
+    def _add_task_columns(df: pd.DataFrame, task: _GSIAsyncTask) -> None:
         """Add satellite column."""
         df["satellite"] = task.satellite

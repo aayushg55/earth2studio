@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 
 from earth2studio.data import UFSObsConv, UFSObsSat
+from earth2studio.data.ufs import _MIN_PARALLEL_FILES, _hours_since_to_datetime
 
 
 @pytest.mark.slow
@@ -174,6 +175,156 @@ def test_ufsobsconv_tolerance_conversion():
     )
     assert ds_asym._tolerance_lower == timedelta(hours=-3)
     assert ds_asym._tolerance_upper == timedelta(hours=1)
+
+
+def test_ufs_time_conversion_matches_pandas():
+    values = np.array(
+        [-45.0, -0.54487, -0.0001, 0.0, 0.12345679, 3.0],
+        dtype=np.float32,
+    )
+    origin = datetime(2024, 1, 1)
+    expected = (pd.to_timedelta(values, unit="h") + origin).to_numpy()
+
+    result = _hours_since_to_datetime(values, origin)
+
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_ufs_time_conversion_matches_pandas_over_cycle_range():
+    """GSI stores whole-cycle offsets in [-3h, +3h]; match pandas across that span."""
+    rng = np.random.default_rng(0)
+    values = rng.uniform(-3.0, 3.0, 100_000).astype(np.float32)
+    origin = datetime(2024, 1, 1)
+    expected = (pd.to_timedelta(values, unit="h") + origin).to_numpy()
+
+    result = _hours_since_to_datetime(values, origin)
+
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "tolerance,expected",
+    [
+        # A 48h HealDA-v2 window is the 8 cycles it is built from, not 9 or 10
+        ((timedelta(hours=-45), timedelta(hours=3)), 8),
+        # A single 6h frame is a single file
+        ((timedelta(hours=-3), timedelta(hours=3)), 1),
+        ((timedelta(hours=-45), timedelta(hours=-39)), 1),
+        # Sub-cycle windows stay within the one cycle that covers them
+        ((timedelta(hours=-1), timedelta(hours=1)), 1),
+        # Reaching past a cycle edge is what pulls in the neighbouring file
+        ((timedelta(hours=-4), timedelta(hours=4)), 3),
+        ((timedelta(hours=-45), timedelta(hours=3, minutes=6)), 9),
+    ],
+)
+def test_ufs_cycle_selection(tolerance, expected):
+    analysis = datetime(2024, 1, 1)
+    cycles = UFSObsConv._cycles(analysis + tolerance[0], analysis + tolerance[1])
+
+    assert len(cycles) == expected
+    assert all(cycle.hour % 6 == 0 for cycle in cycles)
+    # Every selected cycle must overlap the requested window
+    for cycle in cycles:
+        assert cycle + timedelta(hours=3) > analysis + tolerance[0]
+        assert cycle - timedelta(hours=3) < analysis + tolerance[1]
+
+
+@pytest.mark.parametrize(
+    "lower,upper",
+    [(-3, 5), (-3, 9), (0, 6), (-6, 0), (-45, 3), (-2, 7), (-13, 4)],
+)
+def test_ufs_cycles_cover_the_whole_window(lower, upper):
+    """A cycle is selected on its coverage, not on its label.
+
+    Selecting cycles while ``label <= tmax`` drops the trailing file whenever ``tmax`` is
+    not itself a cycle label, and that file holds every observation between
+    ``label - 3h`` and ``tmax``.
+    """
+    analysis = datetime(2024, 1, 1)
+    tmin = analysis + timedelta(hours=lower)
+    tmax = analysis + timedelta(hours=upper)
+    cycles = UFSObsConv._cycles(tmin, tmax)
+    half = UFSObsConv.CYCLE_HALF_WIDTH
+
+    assert cycles[0] - half <= tmin
+    assert cycles[-1] + half >= tmax
+    # Consecutive on the 6-hourly grid, so the covered span has no holes
+    assert cycles == [cycles[0] + timedelta(hours=6 * i) for i in range(len(cycles))]
+    # Minimal: neither end can be dropped without uncovering part of the window
+    if len(cycles) > 1:
+        assert cycles[1] - half > tmin
+        assert cycles[-2] + half < tmax
+
+
+def test_ufs_adjacent_windows_select_disjoint_cycles():
+    """Contiguous rank-local windows must not both claim the shared cycle file."""
+    analysis = datetime(2024, 1, 1)
+    left = UFSObsConv._cycles(
+        analysis + timedelta(hours=-45), analysis + timedelta(hours=-33)
+    )
+    right = UFSObsConv._cycles(
+        analysis + timedelta(hours=-33), analysis + timedelta(hours=-21)
+    )
+
+    assert set(left).isdisjoint(right)
+
+
+def test_ufs_conv_groups_tasks_sharing_a_file():
+    """u/v live in diag_conv_uv, so both must be served by a single decode."""
+    source = UFSObsConv(
+        time_tolerance=(timedelta(hours=-3), timedelta(hours=3)), cache=False
+    )
+    tasks = source._create_tasks([datetime(2024, 1, 1)], ["u", "v", "t"])
+    groups = source._group_tasks(tasks)
+
+    assert len(tasks) == 3
+    assert len(groups) == 2
+    uv_group = next(group for group in groups if len(group) > 1)
+    assert {task.e2s_obs_name for task in uv_group} == {"u", "v"}
+    assert len({task.gsi_obs_key for task in uv_group}) == 1
+
+
+def test_ufs_sat_tasks_never_share_a_file():
+    source = UFSObsSat(time_tolerance=(timedelta(hours=-45), timedelta(hours=3)))
+    tasks = source._create_tasks([datetime(2024, 1, 1)], ["atms", "amsua"])
+    groups = source._group_tasks(tasks)
+
+    assert len(groups) == len(tasks)
+
+
+@pytest.mark.parametrize("cls", [UFSObsConv, UFSObsSat])
+def test_ufsobs_decode_workers_floor(cls):
+    ds = cls(decode_workers=0, cache=False, verbose=False)
+    assert ds._decode_workers == 1
+
+
+@pytest.mark.slow
+@pytest.mark.xfail
+@pytest.mark.timeout(300)
+def test_ufsobssat_decode_workers_agree():
+    """Pooled and in-process decode must return the same frame.
+
+    The pool decodes in worker processes and applies the observation modifiers back
+    in the parent, so this is the check that the split preserves the result.
+    """
+    time = datetime(year=2024, month=1, day=1, hour=0)
+    # Wide enough to span more cycles than _MIN_PARALLEL_FILES, or the pooled arm
+    # falls back to in-process decode and the comparison is vacuous
+    kwargs = dict(
+        time_tolerance=(timedelta(hours=-21), timedelta(hours=3)),
+        satellites=["npp"],
+        cache=True,
+        verbose=False,
+    )
+
+    pooled_source = UFSObsSat(decode_workers=4, **kwargs)
+    tasks = pooled_source._create_tasks([time], ["atms"])
+    assert len(pooled_source._group_tasks(tasks)) >= _MIN_PARALLEL_FILES
+
+    serial = UFSObsSat(decode_workers=1, **kwargs)(time, ["atms"])
+    pooled = pooled_source(time, ["atms"])
+
+    pd.testing.assert_frame_equal(serial, pooled)
 
 
 @pytest.mark.parametrize("cls", [UFSObsConv, UFSObsSat])

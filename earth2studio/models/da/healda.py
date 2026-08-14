@@ -139,6 +139,33 @@ _CONV_CHANNEL_RANGES = [
     ("v", -100.0, 100.0),
 ]
 
+_STATS_FIELDS = ("mean", "std", "min_valid", "max_valid")
+
+
+def _string_codes(column: pd.Series) -> tuple[pd.Index, np.ndarray]:
+    """Distinct values of a string column and each row's index into them.
+
+    Observation frames hold one Python string object per row, so mapping or
+    comparing such a column elementwise costs a Python call per row; through
+    codes it costs one per distinct value.
+    """
+    categorical = column.astype("category")
+    return categorical.cat.categories, categorical.cat.codes.to_numpy()
+
+
+def _gather_channel_stats(
+    stats: dict[str, np.ndarray], local_channel: np.ndarray
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Per-observation normalization stats, and which rows have a channel entry.
+
+    Channels outside the sensor's stats table (raw ids the package does not
+    map, which arrive as -1) have no stats and are reported as unknown for the
+    caller to drop.
+    """
+    known = (local_channel >= 0) & (local_channel < len(stats["mean"]))
+    index = np.where(known, local_channel, 0)
+    return {field: stats[field][index] for field in _STATS_FIELDS}, known
+
 
 @check_optional_dependencies()
 class HealDA(torch.nn.Module, AutoModelMixin):
@@ -209,6 +236,15 @@ class HealDA(torch.nn.Module, AutoModelMixin):
             6, pixel_order=earth2grid.healpix.HEALPIX_PAD_XY
         )
         self._channel_stats = self._build_channel_stats()
+        self._sensor_channel_stats = {
+            sensor: {
+                field: group[field].to_numpy(dtype=np.float64)
+                for field in _STATS_FIELDS
+            }
+            for sensor, group in self._channel_stats.sort_values(
+                "local_channel"
+            ).groupby("sensor", sort=False)
+        }
 
         # Setup lat-lon regridder when requested
         if self._lat_lon:
@@ -515,7 +551,9 @@ class HealDA(torch.nn.Module, AutoModelMixin):
         )
         return self.build_output(prediction, output_coords)
 
-    def create_generator(self) -> Generator[
+    def create_generator(
+        self,
+    ) -> Generator[
         xr.DataArray,
         tuple[pd.DataFrame | None, pd.DataFrame | None],
         None,
@@ -608,9 +646,13 @@ class HealDA(torch.nn.Module, AutoModelMixin):
         platforms = SENSOR_PLATFORMS.get(sensor, [])
         platform_map = {name: i for i, name in enumerate(platforms)}
 
-        unknown_vars = set(df["satellite"].unique()) - set(platform_map.keys())
+        satellites, satellite_codes = _string_codes(df["satellite"])
+        unknown_vars = set(satellites) - set(platform_map.keys())
         if unknown_vars:
             raise ValueError(f"Unknown satellite platform(s) present: {unknown_vars}")
+        platform_lut = np.array(
+            [platform_map[name] for name in satellites], dtype=np.int64
+        )
 
         max_raw = len(stats["raw_to_local"]) - 1
         out_of_bounds = raw_ch[raw_ch > max_raw]
@@ -627,9 +669,7 @@ class HealDA(torch.nn.Module, AutoModelMixin):
                 "obs_time_ns": df["time"].values.astype("datetime64[ns]"),
                 "observation": df["observation"].values.astype(np.float64),
                 "local_channel": (stats["raw_to_local"][raw_ch] - 1).astype(np.int32),
-                "local_platform": df["satellite"]
-                .map(platform_map)
-                .values.astype(np.int64),
+                "local_platform": platform_lut[satellite_codes],
                 "sensor": sensor,
                 "obs_type": np.int32(0),
                 "height": np.float32(np.nan),
@@ -654,15 +694,19 @@ class HealDA(torch.nn.Module, AutoModelMixin):
             Standardized DataFrame with unified column schema
         """
 
-        unknown_vars = set(df["variable"].unique()) - set(CONV_VAR_CHANNEL.keys())
+        variables, variable_codes = _string_codes(df["variable"])
+        unknown_vars = set(variables) - set(CONV_VAR_CHANNEL.keys())
         if unknown_vars:
             raise ValueError(f"Unknown conventional variable(s): {unknown_vars}")
+        channel_lut = np.array(
+            [CONV_VAR_CHANNEL[name] for name in variables], dtype=np.int32
+        )
+        local_channel = channel_lut[variable_codes]
 
         # HealDA v1 was trained with pressure values in hPa, while Earth2Studio
         # conventional data sources provide pressure-like fields in Pa.
         obs = df["observation"].values.astype(np.float64)
-        is_pres_obs = df["variable"].values == "pres"
-        obs[is_pres_obs] /= 100.0  # Pa -> hPa
+        obs[local_channel == CONV_VAR_CHANNEL["pres"]] /= 100.0  # Pa -> hPa
 
         pressure = df["pres"].values.astype(np.float32) / np.float32(100.0)  # Pa -> hPa
 
@@ -672,9 +716,7 @@ class HealDA(torch.nn.Module, AutoModelMixin):
                 "lon": df["lon"].values.astype(np.float32),
                 "obs_time_ns": df["time"].values.astype("datetime64[ns]"),
                 "observation": obs,
-                "local_channel": df["variable"]
-                .map(CONV_VAR_CHANNEL)
-                .values.astype(np.int32),
+                "local_channel": local_channel,
                 "local_platform": np.int64(0),
                 "sensor": "conv",
                 "obs_type": df["type"].fillna(0).values.astype(np.int32),
@@ -719,18 +761,28 @@ class HealDA(torch.nn.Module, AutoModelMixin):
             request time.
         """
         # 1. Standardize raw inputs into a unified schema.
+        sensors: list[str] = []
         parts: list[pd.DataFrame] = []
         if conv_obs is not None and len(conv_obs) > 0:
+            sensors.append("conv")
             parts.append(self.prep_conv(conv_obs))
         if sat_obs is not None and len(sat_obs) > 0:
+            # Split on the variable column once; a mask per sensor would read the
+            # whole column once per sensor
+            by_sensor = dict(iter(sat_obs.groupby("variable", sort=False)))
             for sensor in SAT_SENSORS:
-                sensor_df = sat_obs[sat_obs["variable"] == sensor]
-                if len(sensor_df) > 0:
+                sensor_df = by_sensor.get(sensor)
+                if sensor_df is not None and len(sensor_df) > 0:
+                    sensors.append(sensor)
                     parts.append(self.prep_sat_sensor(sensor_df, sensor))
 
         if not parts:
             return {s: [None] * len(request_time) for s in ALL_SENSORS}
 
+        # Each part holds one sensor, so the concatenated frame is blocked by sensor
+        # and every later step addresses a sensor by row range instead of comparing
+        # the sensor column
+        bounds = np.cumsum([0, *(len(part) for part in parts)])
         obs = pd.concat(parts, ignore_index=True)
 
         # Convert cudf to pandas if needed (TODO: See if can be removed)
@@ -738,43 +790,65 @@ class HealDA(torch.nn.Module, AutoModelMixin):
             obs = obs.to_pandas()
 
         # 2. QC and normalize once on the full set (time-independent).
-        obs = obs.merge(self._channel_stats, on=["sensor", "local_channel"], how="left")
-        valid = obs["observation"].notna()
-        valid &= (obs["observation"] >= obs["min_valid"]) & (
-            obs["observation"] <= obs["max_valid"]
+        local_channel = obs["local_channel"].to_numpy()
+        observation = obs["observation"].to_numpy()
+        stats = {field: np.zeros(len(obs)) for field in _STATS_FIELDS}
+        valid = np.zeros(len(obs), dtype=bool)
+        for part_id, sensor in enumerate(sensors):
+            rows = slice(bounds[part_id], bounds[part_id + 1])
+            sensor_stats = self._sensor_channel_stats.get(sensor)
+            if sensor_stats is None:
+                continue
+            gathered, known = _gather_channel_stats(sensor_stats, local_channel[rows])
+            for field, values in gathered.items():
+                stats[field][rows] = values
+            valid[rows] = known
+
+        valid &= ~np.isnan(observation)
+        valid &= (observation >= stats["min_valid"]) & (
+            observation <= stats["max_valid"]
         )
 
         # Conv-specific: height and pressure physical bounds
-        is_conv = obs["sensor"] == "conv"
-        if is_conv.any():
-            is_gps = obs["local_channel"] <= 2
+        if sensors[0] == "conv":
+            rows = slice(bounds[0], bounds[1])
+            height = obs["height"].to_numpy()[rows]
+            pressure = obs["pressure"].to_numpy()[rows]
             pres_min = np.where(
-                is_conv & is_gps,
+                local_channel[rows] <= 2,
                 _QC_PRESSURE_MIN_GPS,
                 _QC_PRESSURE_MIN_DEFAULT,
             )
-            height_ok = (
-                obs["height"].notna()
-                & (obs["height"] >= _QC_HEIGHT_MIN)
-                & (obs["height"] <= _QC_HEIGHT_MAX)
+            valid[rows] &= (
+                ~np.isnan(height)
+                & (height >= _QC_HEIGHT_MIN)
+                & (height <= _QC_HEIGHT_MAX)
+                & ~np.isnan(pressure)
+                & (pressure >= pres_min)
+                & (pressure <= _QC_PRESSURE_MAX)
             )
-            pressure_ok = (
-                obs["pressure"].notna()
-                & (obs["pressure"] >= pres_min)
-                & (obs["pressure"] <= _QC_PRESSURE_MAX)
-            )
-            valid &= ~is_conv | (height_ok & pressure_ok)
 
-        obs = obs[valid].copy()
-        obs["observation"] = ((obs["observation"] - obs["mean"]) / obs["std"]).astype(
+        obs["observation"] = ((observation - stats["mean"]) / stats["std"]).astype(
             np.float32
         )
-        obs = obs.drop(columns=["mean", "std", "min_valid", "max_valid"])
+        obs = obs[valid]
 
-        # 3. Split by sensor, then by time within each sensor.
+        # 3. Split by sensor, then by time within each sensor. Dropping rows keeps the
+        # frame blocked by sensor, so a block is a row range in the filtered frame.
+        kept = np.cumsum(
+            [
+                0,
+                *(
+                    int(valid[bounds[i] : bounds[i + 1]].sum())
+                    for i in range(len(parts))
+                ),
+            ]
+        )
+        blocks = {sensor: (kept[i], kept[i + 1]) for i, sensor in enumerate(sensors)}
         result: dict[str, list[pd.DataFrame | None]] = {}
         for sensor in ALL_SENSORS:
-            sensor_df = obs[obs["sensor"] == sensor]
+            start, stop = blocks.get(sensor, (0, 0))
+            sensor_df = obs.iloc[start:stop]
             time_list: list[pd.DataFrame | None] = []
             for t in request_time:
                 t_arr = np.array([t], dtype="datetime64[ns]")
