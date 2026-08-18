@@ -225,6 +225,14 @@ def fetch_dataframe(
         return df
 
 
+def _data_array_to_tensor(da: xr.DataArray, device: torch.device) -> torch.Tensor:
+    """CuPy arrays use DLPack after a C-contiguous gather; ``da.values`` cannot convert them implicitly."""
+    data = da.data
+    if cp is not None and isinstance(data, cp.ndarray):
+        return torch.from_dlpack(cp.ascontiguousarray(data)).to(device)
+    return torch.as_tensor(np.asarray(data)).to(device)
+
+
 def prep_data_array(
     da: xr.DataArray,
     device: torch.device = "cpu",
@@ -280,7 +288,7 @@ def prep_data_array(
                 lat_out=interp_to["_lat"],
                 lon_out=interp_to["_lon"],
             ).to(device)
-            data = torch.Tensor(da.values).to(device)
+            data = _data_array_to_tensor(da, device)
             out = interp(data)
 
             # HARD CODE FOR STORMCAST
@@ -304,13 +312,13 @@ def prep_data_array(
                 method=interp_method,
             )
 
-            out = torch.Tensor(da.values).to(device)
+            out = _data_array_to_tensor(da, device)
 
         out_coords["_lat"] = interp_to["_lat"]
         out_coords["_lon"] = interp_to["_lon"]
 
     else:
-        out = torch.Tensor(da.values).to(device)
+        out = _data_array_to_tensor(da, device)
         if "lat" in da.coords and "lat" not in da.coords.dims:
             # Curvilinear grid case: lat/lon coords are 2D arrays, not in dims
             out_coords["lat"] = da.coords["lat"].values
