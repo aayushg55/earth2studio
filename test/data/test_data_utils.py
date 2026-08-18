@@ -131,6 +131,19 @@ def test_prep_dataarray(foo_data_array, dims, device):
     assert out.shape == data_array.data.shape
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda missing")
+def test_prep_data_array_cupy():
+    cp = pytest.importorskip("cupy", reason="cupy not installed")
+    data = cp.arange(24, dtype=cp.float32).reshape(2, 3, 4).transpose(0, 2, 1)
+    data_array = xr.DataArray(data, dims=["one", "two", "three"])
+
+    out, _ = prep_data_array(data_array, device="cuda:0")
+
+    expected = torch.arange(24, dtype=torch.float32, device="cuda:0")
+    expected = expected.reshape(2, 3, 4).transpose(1, 2)
+    torch.testing.assert_close(out, expected)
+
+
 def test_prep_data_array_curvilinear(equilinear_data_array, curvilinear_data_array):
     pytest.importorskip("scipy", reason="scipy not installed")
     # Create another curvilinear grid
