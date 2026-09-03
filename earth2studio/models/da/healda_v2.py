@@ -96,6 +96,17 @@ MODEL_PARALLEL_SIZES = (1, 2, 4, 8)
 PACKAGE_ENV_VAR = "HEALDA_V2_PACKAGE"
 CHECKPOINT_FILE = "healda_v2.mdlus"
 
+# The 77-channel finetune appends three surface fields to the 74 the trunk was
+# pretrained on. Their internal names are already E2S vocabulary.
+EXTRA_SURFACE_CHANNELS = ["d2m", "skt", "sp"]
+
+# That finetune predicts sp as a correction to msl exp(-g z / (Rd tas)), so
+# inference adds the same estimate back. The orography is ERA5's, in metres:
+# a different field from the z-scored UFS orography the conditioning carries.
+OROGRAPHY_FILE = "static/orography_era5_hpx6_padxy.npy"
+R_D = 287.053
+GRAVITY = 9.80665
+
 # Microwave sounders consumed directly and infrared sounders consumed through
 # PCA compression. UFSObsSat variable names for the raw IR sensors differ from
 # the internal sensor names.
@@ -222,9 +233,50 @@ def _enable_context_parallel(
     model.set_context_parallel("all_to_all", group)
 
 
+def channel_names(extra_surface: bool) -> tuple[list[str], list[str]]:
+    """Internal names, which index the stats CSV, and the E2S output vocabulary.
+
+    The three extra surface names are the same in both.
+    """
+    if extra_surface:
+        return (
+            [*ERA5_CHANNELS, *EXTRA_SURFACE_CHANNELS],
+            [*E2S_CHANNELS, *EXTRA_SURFACE_CHANNELS],
+        )
+    return list(ERA5_CHANNELS), list(E2S_CHANNELS)
+
+
+def _anchor_sp(
+    prediction: torch.Tensor,
+    orography: torch.Tensor,
+    indices: tuple[int, int, int],
+    sp_mean: torch.Tensor,
+) -> torch.Tensor:
+    """Add the hypsometric estimate back onto the sp correction the head predicts.
+
+    Physical-space form of healda's ``HypsometricSpAnchor``: denormalizing the
+    anchored channel leaves sp's own centre where the estimate belongs, so replacing
+    one with the other recovers surface pressure.
+    """
+    sp, msl, tas = indices
+    estimate = prediction[:, msl] * torch.exp(
+        -GRAVITY * orography / (R_D * prediction[:, tas])
+    )
+    anchored = prediction.clone()
+    anchored[:, sp] = prediction[:, sp] - sp_mean + estimate
+    return anchored
+
+
+def _load_orography(package: Package, device: torch.device) -> torch.Tensor:
+    """ERA5 orography in metres, ``HEALPIX_PAD_XY``, flattened to broadcast over npix."""
+    array = np.load(package.resolve(OROGRAPHY_FILE))
+    return torch.from_numpy(array).to(device).float().reshape(-1)
+
+
 def _random_benchmark_assets(
     device: torch.device,
     npix: int,
+    n_channels: int,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -235,7 +287,7 @@ def _random_benchmark_assets(
 ]:
     generator = torch.Generator().manual_seed(0)
     condition = torch.randn(1, 2, 1, npix, generator=generator).to(device)
-    era5_mean = torch.zeros(1, len(ERA5_CHANNELS), 1, 1, device=device)
+    era5_mean = torch.zeros(1, n_channels, 1, 1, device=device)
     era5_std = torch.ones_like(era5_mean)
 
     channel_count = sum(SENSOR_CHANNELS.values())
@@ -283,6 +335,7 @@ def _random_benchmark_assets(
 def _load_package_assets(
     package: Package,
     device: torch.device,
+    channels: list[str],
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -334,7 +387,7 @@ def _load_package_assets(
     channel = np.where(
         level.eq(-1), stats["variable"], stats["variable"] + level.astype(str)
     )
-    ordered = stats.assign(channel=channel).set_index("channel").loc[ERA5_CHANNELS]
+    ordered = stats.assign(channel=channel).set_index("channel").loc[channels]
     era5_mean = torch.from_numpy(ordered["mean"].to_numpy(dtype=np.float32)).view(
         1, -1, 1, 1
     )
@@ -459,6 +512,8 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         random_assets: bool = False,
         lat_lon: bool = False,
         output_resolution: tuple[int, int] = (181, 360),
+        extra_surface: bool = False,
+        orography: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self._model = model
@@ -466,6 +521,19 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         self.register_buffer("_era5_mean", era5_mean)
         self.register_buffer("_era5_std", era5_std)
         self.register_buffer("device_buffer", torch.empty(0))
+
+        self._extra_surface = extra_surface
+        self._channels, self._e2s_channels = channel_names(extra_surface)
+        if len(self._channels) != int(model.out_channels):
+            raise ValueError(
+                f"extra_surface={extra_surface} wants {len(self._channels)} channels, "
+                f"checkpoint emits {int(model.out_channels)}"
+            )
+        if extra_surface:
+            self.register_buffer("_orography", orography)
+            self._sp_anchor = tuple(
+                self._channels.index(name) for name in ("sp", "pres_msl", "tas")
+            )
         self._channel_stats = channel_stats[
             ["Global_Channel_ID", "mean", "stddev", "min_valid", "max_valid"]
         ]
@@ -614,7 +682,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                     OrderedDict(
                         {
                             "time": request_time,
-                            "variable": np.array(E2S_CHANNELS, dtype=str),
+                            "variable": np.array(self._e2s_channels, dtype=str),
                             "lat": self._output_lat,
                             "lon": self._output_lon,
                         }
@@ -627,7 +695,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
                 OrderedDict(
                     {
                         "time": request_time,
-                        "variable": np.array(E2S_CHANNELS, dtype=str),
+                        "variable": np.array(self._e2s_channels, dtype=str),
                         "npix": np.arange(self._npix_out),
                     }
                 )
@@ -677,6 +745,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         model_parallel_size: int | None = None,
         lat_lon: bool = False,
         output_resolution: tuple[int, int] = (181, 360),
+        extra_surface: bool = False,
     ) -> "HealDAv2":
         """Build a HealDA-v2 model, from a package's weights or randomly.
 
@@ -685,6 +754,7 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
 
             healda_v2.mdlus                        # weights, no optimizer state
             static/condition_hpx6_padxy.npy        # [1, 2, 1, npix] conditioning
+            static/orography_era5_hpx6_padxy.npy   # sp anchor, extra_surface only
             stats/channel_table.parquet            # global channel stats
             stats/conv_normalizations_by_level.csv # per-level conv stats
             stats/era5_13_levels_stats.csv         # output denormalization
@@ -711,12 +781,18 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             bilinear step from the native HEALPix level-6 grid. Only used when
             ``lat_lon=True``. ``(721, 1440)`` gives 0.25 degrees; by default
             ``(181, 360)``, 1 degree
+        extra_surface : bool, optional
+            Select the 77-channel package, which appends ``d2m``, ``skt`` and
+            ``sp``, applies the hypsometric ``sp`` anchor and needs
+            ``static/orography_era5_hpx6_padxy.npy``; by default False, the
+            74-channel package
 
         Returns
         -------
         HealDAv2
             HealDA-v2 assimilation model
         """
+        channels, _ = channel_names(extra_surface)
         device, parallel_size, parallel_rank, parallel_group = _setup_model_parallel(
             model_parallel_size
         )
@@ -737,9 +813,11 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
         model.eval()
 
         if package is None:
-            assets = _random_benchmark_assets(device, int(model.npix))
+            assets = _random_benchmark_assets(device, int(model.npix), len(channels))
+            orography = torch.zeros(int(model.npix), device=device)
         else:
-            assets = _load_package_assets(package, device)
+            assets = _load_package_assets(package, device, channels)
+            orography = _load_orography(package, device) if extra_surface else None
         condition, era5_mean, era5_std, channel_stats, raw_to_local, codecs = assets
 
         wrapper = cls(
@@ -756,6 +834,8 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             random_assets=package is None,
             lat_lon=lat_lon,
             output_resolution=output_resolution,
+            extra_surface=extra_surface,
+            orography=orography,
         )
         return wrapper.to(device)
 
@@ -1274,6 +1354,13 @@ class HealDAv2(torch.nn.Module, AutoModelMixin):
             )
         # Denormalize the local time shard.
         prediction = self._era5_std * prediction.float() + self._era5_mean
+        if self._extra_surface:
+            prediction = _anchor_sp(
+                prediction,
+                self._orography,
+                self._sp_anchor,
+                self._era5_mean[0, self._sp_anchor[0], 0],
+            )
         if self._model_parallel_rank == self._model_parallel_size - 1:
             analysis = prediction[:, :, -1].contiguous()
         else:

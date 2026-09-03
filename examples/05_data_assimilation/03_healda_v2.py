@@ -95,8 +95,18 @@ from earth2studio.models.da import HealDAv2
 # 0.25 degrees, which matches the ERA5 fields used for verification below.
 
 # %%
+# ``HEALDA_V2_EXTRA_SURFACE=1`` selects the 77-channel package, which also predicts
+# ``d2m``, ``skt`` and ``sp``. Everything below is common to both.
+
+# %%
+extra_surface = os.environ.get("HEALDA_V2_EXTRA_SURFACE", "0") == "1"
 package = HealDAv2.load_default_package()
-model = HealDAv2.load_model(package, lat_lon=True, output_resolution=(721, 1440))
+model = HealDAv2.load_model(
+    package,
+    lat_lon=True,
+    output_resolution=(721, 1440),
+    extra_surface=extra_surface,
+)
 
 # %%
 # Fetch Observations
