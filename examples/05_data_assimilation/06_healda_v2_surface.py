@@ -172,12 +172,16 @@ def to_numpy(arr):
 
 
 def era5_on_hpx(var):
-    fine = era5_to_fine(torch.as_tensor(to_numpy(era5.sel(variable=var).data[0])).double())
+    """ERA5 area-averaged onto the analysis grid, in HEALPIX_PAD_XY order."""
+    fine = era5_to_fine(
+        torch.as_tensor(to_numpy(era5.sel(variable=var).data[0])).double()
+    )
     coarse = fine.reshape(-1, 4 ** (FINE_LEVEL - level)).mean(-1)
     return healpix.reorder(coarse, healpix.PixelOrder.NEST, healpix.HEALPIX_PAD_XY)
 
 
 def analysis_on_hpx(var):
+    """One analysis channel as a torch tensor over npix."""
     return torch.as_tensor(to_numpy(analysis.sel(variable=var).data[0])).double()
 
 
@@ -187,6 +191,7 @@ def rmse(prediction, truth):
 
 
 def to_map(field):
+    """A HEALPix field regridded to half-degree lat-lon for plotting."""
     return hpx_to_plot(field).numpy()
 
 
