@@ -156,14 +156,14 @@ era5 = NCAR_ERA5()(analysis_time, surface_vars + shared_vars)
 era5_to_fine = earth2grid.get_regridder(
     earth2grid.latlon.equiangular_lat_lon_grid(ERA5_NLAT, ERA5_NLON),
     healpix.Grid(FINE_LEVEL, pixel_order=healpix.PixelOrder.NEST),
-)
+).float()
 # Half a degree for the maps, plenty for a 100 km analysis.
 plot_lat = np.linspace(90, -90, 361)
 plot_lon = np.linspace(0, 360, 720, endpoint=False)
 hpx_to_plot = earth2grid.get_regridder(
     healpix.Grid(level, pixel_order=healpix.HEALPIX_PAD_XY),
     earth2grid.latlon.equiangular_lat_lon_grid(361, 720),
-)
+).float()
 
 
 def to_numpy(arr):
@@ -174,7 +174,7 @@ def to_numpy(arr):
 def era5_on_hpx(var):
     """ERA5 area-averaged onto the analysis grid, in HEALPIX_PAD_XY order."""
     fine = era5_to_fine(
-        torch.as_tensor(to_numpy(era5.sel(variable=var).data[0])).double()
+        torch.as_tensor(to_numpy(era5.sel(variable=var).data[0])).float()
     )
     coarse = fine.reshape(-1, 4 ** (FINE_LEVEL - level)).mean(-1)
     return healpix.reorder(coarse, healpix.PixelOrder.NEST, healpix.HEALPIX_PAD_XY)
@@ -182,7 +182,7 @@ def era5_on_hpx(var):
 
 def analysis_on_hpx(var):
     """One analysis channel as a torch tensor over npix."""
-    return torch.as_tensor(to_numpy(analysis.sel(variable=var).data[0])).double()
+    return torch.as_tensor(to_numpy(analysis.sel(variable=var).data[0])).float()
 
 
 def rmse(prediction, truth):
