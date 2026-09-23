@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computation method, height assignment, zenith angle and quality indicators
 - `NNJAObsConv` gains `exclude_message_types` to skip PrepBUFR message families
   at decode, e.g. `("SATWND",)` when AMVs come from `NNJAObsSatwnd`
+- Added `gps_refractivity` to `NNJAObsConv` and `NomadsGDASObsConv` exposing
+  the GPS-RO refractivity levels (`ARFR`, N-units) with `elev` set to the level
+  height (`HEIT`), plus `radius_curvature` (`ELRC`) and `geoid_undulation`
+  (`GEODU`) columns on GPS-RO rows
 
 ### Changed
 
@@ -68,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `NNJAObsConv` / `NomadsGDASObsConv` GPS-RO decode keeps bending-angle levels
+  without their own tangent point, placing them at the occultation's reference
+  point instead of dropping them
 - `CorrDiffCosmoEra5SDA`: retuned the default DPS guidance (`sda_std_obs`
   `0.5` -> `0.75`, `sda_gamma` `5e-5` -> `7.5e-5`) to keep the observation-guided
   analysis stable (the old defaults could diverge to non-finite output).
