@@ -129,7 +129,9 @@ def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     )
     assert set(pairs.lead) == {6} and set(pairs.init) == {pd.Timestamp(init)}
 
-    glob = table[table.region == "global"].set_index("field")
+    glob = table[(table.region == "global") & (table.match == "strict")].set_index(
+        "field"
+    )
     assert glob.loc["tas", "count"] == 40
     np.testing.assert_allclose(glob.loc["tas", "rmse"], 1.0, atol=2e-4)
     assert (table.time == valid).all() and (table.lead_time == pd.Timedelta(lead)).all()
@@ -141,7 +143,7 @@ def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     import xarray as xr
 
     ds = xr.open_zarr(root / "arm" / "scores_all.zarr")
-    assert ds.rmse.dims == ("init", "lead_time", "region", "field")
+    assert ds.rmse.dims == ("init", "lead_time", "match", "region", "field")
     assert ds.time.values[0, 0] == np.datetime64(valid)
 
 
