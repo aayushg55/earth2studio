@@ -24,6 +24,12 @@ from omegaconf import DictConfig
 from physicsnemo.distributed import DistributedManager
 from src.data import resolve_ic_source
 from src.distributed import configure_logging
+from src.obs_online import (
+    ObservationScorer,
+    WithObservations,
+    finalize_observation_scores,
+    parse_observation_settings,
+)
 from src.online import (
     build_group_comm,
     build_online_scorers,
@@ -215,6 +221,7 @@ def _run_online(
             if dist.rank == 0:
                 finalize_stats(cfg)
                 compact_stats_store(cfg)
+                finalize_observation_scores(cfg)
             return
     else:
         remaining_times = list(all_times)
@@ -322,16 +329,26 @@ def _run_online(
                 device,
                 known_missing_leads=pipeline.known_missing_leads(),
             )
-            pipeline.run(
-                my_items,
-                data_source,
-                raw_mgr,
-                output_variables,
-                device,
-                cfg,
-                scorer=scorer,
-                member_batch=settings.members_per_rank,
-            )
+            obs_settings = parse_observation_settings(cfg)
+            if obs_settings is not None:
+                scorer = WithObservations(
+                    scorer,
+                    ObservationScorer(cfg, obs_settings, ensemble_size, dist.rank),
+                )
+            try:
+                pipeline.run(
+                    my_items,
+                    data_source,
+                    raw_mgr,
+                    output_variables,
+                    device,
+                    cfg,
+                    scorer=scorer,
+                    member_batch=settings.members_per_rank,
+                )
+            finally:
+                if obs_settings is not None:
+                    scorer.close()
         else:
             logger.info(f"Rank {dist.rank}: no ICs assigned, waiting at barrier.")
 
@@ -349,6 +366,7 @@ def _run_online(
                     finalize_scores_store_name(cfg), ref_name
                 ),
             )
+        finalize_observation_scores(cfg)
         # A multi-job campaign shares these stores, so this job finishing its
         # own slice does not mean the campaign is done; re-check all_times.
         if not filter_online_completed(list(all_times), cfg):
