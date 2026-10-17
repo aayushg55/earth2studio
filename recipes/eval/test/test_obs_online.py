@@ -143,3 +143,32 @@ def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     ds = xr.open_zarr(root / "arm" / "scores_all.zarr")
     assert ds.rmse.dims == ("init", "lead_time", "region", "field")
     assert ds.time.values[0, 0] == np.datetime64(valid)
+
+
+def test_resume_reruns_ics_without_observation_scores_and_overwrite_clears(tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "run_id": "arm",
+            "output": {"path": str(tmp_path)},
+            "scoring": {
+                "online": {"observations": {"scorer_root": "/x", "cache": "/m"}}
+            },
+        }
+    )
+    settings = parse_observation_settings(cfg)
+    root = obs_online.store_root(cfg, settings)
+    times = [np.datetime64("2026-06-01T06"), np.datetime64("2026-06-01T18")]
+    done = obs_online._done_dir(root, settings)
+    done.mkdir(parents=True)
+    (done / obs_online._online_marker_name(times[0])).touch()
+    part = root / "parts" / settings.system / "20260601T0600_r0001.parquet"
+    part.parent.mkdir(parents=True)
+    part.touch()
+
+    assert obs_online.filter_observation_completed(times, cfg) == times[1:]
+    assert part in obs_online._ic_outputs(root, settings, times[0])
+    obs_online.clear_observation_scores(cfg)
+    assert obs_online.filter_observation_completed(times, cfg) == times
+    assert not part.exists()
+    off = OmegaConf.create({"scoring": {}})
+    assert obs_online.filter_observation_completed(times, off) == []

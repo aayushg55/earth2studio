@@ -27,6 +27,8 @@ from src.distributed import configure_logging
 from src.obs_online import (
     ObservationScorer,
     WithObservations,
+    clear_observation_scores,
+    filter_observation_completed,
     finalize_observation_scores,
     parse_observation_settings,
 )
@@ -213,7 +215,11 @@ def _run_online(
 
     resume = cfg.get("resume", False)
     if resume:
-        remaining_times = filter_online_completed(list(all_times), cfg)
+        # An IC runs again when its gridded or its observation scores are missing.
+        remaining_times = sorted(
+            set(filter_online_completed(list(all_times), cfg))
+            | set(filter_observation_completed(list(all_times), cfg))
+        )
         if not remaining_times:
             logger.success("All ICs already scored online — nothing to do.")
             if dist.distributed:
@@ -227,6 +233,7 @@ def _run_online(
         remaining_times = list(all_times)
         if cfg.output.get("overwrite", False):
             clear_online_progress(cfg)
+            clear_observation_scores(cfg)
 
     my_times: list[np.datetime64] = []
     my_items = []
@@ -333,7 +340,9 @@ def _run_online(
             if obs_settings is not None:
                 scorer = WithObservations(
                     scorer,
-                    ObservationScorer(cfg, obs_settings, ensemble_size, dist.rank),
+                    ObservationScorer(
+                        cfg, obs_settings, ensemble_size, dist.rank, comm, device
+                    ),
                 )
             try:
                 pipeline.run(
@@ -372,7 +381,8 @@ def _run_online(
         if not filter_online_completed(list(all_times), cfg):
             for ref_name in verif_sources:
                 compact_stats_store(
-                    cfg, stats_store=named_store_filename(settings.stats_store, ref_name)
+                    cfg,
+                    stats_store=named_store_filename(settings.stats_store, ref_name),
                 )
 
 

@@ -78,7 +78,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from earth2studio.utils.coords import CoordSystem
 
-from .work import WorkItem
+from .work import WorkItem, _online_marker_name
 
 # earth2studio surface names -> observation-scorer channel names.  Pressure-level
 # variables map by rule: z500 -> Z500 (geopotential), t/u/v/q likewise.
@@ -180,6 +180,50 @@ def standard_regions() -> dict:
 
 def store_root(cfg: DictConfig, settings: ObservationSettings) -> Path:
     return Path(cfg.output.path) / settings.store_dir
+
+
+def _done_dir(root: Path, settings: ObservationSettings) -> Path:
+    return root / "done" / settings.system
+
+
+def _ic_outputs(root: Path, settings: ObservationSettings, time) -> list[Path]:
+    """Every part, pairs file and done marker of one IC, from any rank."""
+    stamp = f"{pd.Timestamp(time):%Y%m%dT%H%M}_r*.parquet"
+    dirs = [
+        root / "parts" / settings.system,
+        root / "pairs" / settings.stations / settings.system,
+    ]
+    files = [f for d in dirs for f in d.glob(stamp)]
+    marker = _done_dir(root, settings) / _online_marker_name(np.datetime64(time))
+    return files + ([marker] if marker.exists() else [])
+
+
+def filter_observation_completed(
+    times: list[np.datetime64], cfg: DictConfig
+) -> list[np.datetime64]:
+    """IC times without an observation-score done marker; none when scoring is off."""
+    settings = parse_observation_settings(cfg)
+    if settings is None:
+        return []
+    done = _done_dir(store_root(cfg, settings), settings)
+    have = {f.name for f in done.glob("*.done")} if done.exists() else set()
+    return [t for t in times if _online_marker_name(t) not in have]
+
+
+def clear_observation_scores(cfg: DictConfig) -> None:
+    """Remove every part, pairs file and done marker, for an overwrite run."""
+    import shutil
+
+    settings = parse_observation_settings(cfg)
+    if settings is None:
+        return
+    root = store_root(cfg, settings)
+    for d in (
+        root / "parts" / settings.system,
+        root / "pairs" / settings.stations / settings.system,
+        _done_dir(root, settings),
+    ):
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +367,11 @@ class ObservationScorer:
         Ensemble size; above 1 the outputs carry a ``member`` column.
     rank : int
         Global rank, for per-rank output file names.
+    comm : GroupComm
+        The ensemble group: its root clears an IC's earlier outputs and writes
+        the IC's done marker once every rank of the group has written.
+    device : torch.device
+        Device the group's collectives are staged on.
     """
 
     def __init__(
@@ -331,16 +380,26 @@ class ObservationScorer:
         settings: ObservationSettings,
         ensemble_size: int,
         rank: int,
+        comm: Any,
+        device: torch.device,
     ) -> None:
         self._settings = settings
         self._root = store_root(cfg, settings)
         self._members = ensemble_size > 1
         self._rank = rank
+        self._comm = comm
+        self._device = device
         self._pool = _spawn_pool(settings, settings.workers)
         self._item: WorkItem | None = None
         self._pending: list[Future] = []
 
     def begin_item(self, item: WorkItem) -> None:
+        # Outputs of an earlier, unfinished attempt at this IC, possibly from
+        # other ranks. The group runs an IC in lockstep, so no peer has written
+        # this IC's outputs before the root clears them here.
+        if self._comm.is_root:
+            for path in _ic_outputs(self._root, self._settings, item.time):
+                path.unlink(missing_ok=True)
         self._item = item
         self._pending = []
 
@@ -389,12 +448,29 @@ class ObservationScorer:
                 )
 
     def finish_item(self, item: WorkItem) -> None:
+        self._write_item(item)
+        # Every rank of the group has written its members before the root
+        # marks the IC done.
+        self._comm.all_agree(1, self._device)
+        if self._comm.is_root:
+            marker = _done_dir(self._root, self._settings) / _online_marker_name(
+                np.datetime64(item.time)
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        self._item = None
+
+    def _write_item(self, item: WorkItem) -> None:
+        steps = len(self._pending)
         results = [f.result() for f in self._pending]
         self._pending = []
         results = [r for r in results if r is not None]
+        if len(results) < steps:
+            logger.warning(
+                f"IC {item.time}: {steps - len(results)} of {steps} lead steps "
+                "had no observations"
+            )
         if not results:
-            logger.warning(f"IC {item.time}: no observations at any lead time.")
-            self._item = None
             return
         name = f"{pd.Timestamp(item.time):%Y%m%dT%H%M}_r{self._rank:04d}.parquet"
         _write(
@@ -412,7 +488,6 @@ class ObservationScorer:
                     / self._settings.system
                     / name,
                 )
-        self._item = None
 
     def close(self) -> None:
         self._pool.shutdown()
