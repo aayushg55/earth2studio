@@ -51,6 +51,7 @@ it off::
           stations: all                         # all | withheld | kept
           by_dataset: false
           dedupe_surface: false
+          elevation_correct: false              # tas / sp to the station elevation
           vertical: pressure                    # pressure | height
           pairs: false
           system: null                          # null -> run_id
@@ -115,6 +116,7 @@ class ObservationSettings:
     stations: str = "all"
     by_dataset: bool = False
     dedupe_surface: bool = False
+    elevation_correct: bool = False
     vertical: str = "pressure"
     pairs: bool = False
     system: str = "forecast"
@@ -245,9 +247,25 @@ def _init_worker(settings: ObservationSettings) -> None:
             f"healda was imported from {loaded.__file__} before the observation "
             f"scorer at {root}; the scorer needs its own checkout's package."
         )
-    from private.obs_scoring import cycle
+    from private.obs_scoring import cycle, fields
 
-    _worker.update(settings=settings, cycle=cycle, regions=standard_regions(), obs={})
+    _worker.update(
+        settings=settings,
+        cycle=cycle,
+        fields=fields,
+        regions=standard_regions(),
+        obs={},
+        orography={},
+    )
+
+
+def _orography(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
+    """ERA5 terrain on the forecast grid, kept per grid."""
+    key = (lat.size, float(lat[0]), lon.size, float(lon[0]))
+    cache = _worker["orography"]
+    if key not in cache:
+        cache[key] = _worker["fields"].era5_orography_on(lat, lon)
+    return cache[key]
 
 
 def _cycle_obs(valid: pd.Timestamp) -> pd.DataFrame | None:
@@ -284,10 +302,10 @@ def _score_step(
     array = values.numpy()
 
     def fields_at(wanted: list[str]) -> xr.Dataset:
-        return xr.Dataset(
-            {n: (("lat", "lon"), array[index[n]]) for n in wanted if n in index},
-            coords={"lat": lat, "lon": lon},
-        )
+        data = {n: (("lat", "lon"), array[index[n]]) for n in wanted if n in index}
+        if "orography" in wanted:
+            data["orography"] = (("lat", "lon"), _orography(lat, lon))
+        return xr.Dataset(data, coords={"lat": lat, "lon": lon})
 
     table, paired = _worker["cycle"].score_cycle(
         fields_at,
@@ -296,7 +314,7 @@ def _score_step(
         _worker["regions"],
         s.by,
         s.vertical,
-        False,
+        s.elevation_correct,
         s.pairs,
     )
     extra = {"init": pd.Timestamp(init), "lead_time": pd.Timedelta(lead)}

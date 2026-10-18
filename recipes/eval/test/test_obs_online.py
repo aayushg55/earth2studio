@@ -147,6 +147,37 @@ def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     assert ds.time.values[0, 0] == np.datetime64(valid)
 
 
+@needs_scorer
+def test_elevation_correction_moves_tas_to_the_station(tmp_path):
+    import dataclasses
+
+    import xarray as xr
+
+    settings, names, values, lat, lon, valid, obs = synthetic_step(tmp_path)
+    init = np.datetime64("2026-07-15T06", "ns")
+    lead = np.timedelta64(6, "h").astype("timedelta64[ns]")
+    model = {}
+    for correct in (False, True):
+        obs_online._init_worker(
+            dataclasses.replace(settings, elevation_correct=correct)
+        )
+        obs_online._worker["obs"][valid] = obs
+        _, pairs = obs_online._score_step(init, lead, None, names, values, lat, lon)
+        model[correct] = pairs[pairs.field == "tas"].model.to_numpy()
+
+    tas = obs[obs.field == "tas"]
+    terrain = (
+        xr.DataArray(
+            obs_online._worker["fields"].era5_orography(),
+            coords={"lat": np.linspace(90, -90, 721), "lon": np.arange(1440) * 0.25},
+        )
+        .interp(lat=xr.DataArray(tas.lat.values), lon=xr.DataArray(tas.lon.values))
+        .values
+    )
+    # Stations at 0 m: the model's 2 m temperature warms by the lapse rate over its terrain.
+    np.testing.assert_allclose(model[True] - model[False], 0.0065 * terrain, atol=0.3)
+
+
 def test_resume_reruns_ics_without_observation_scores_and_overwrite_clears(tmp_path):
     cfg = OmegaConf.create(
         {
