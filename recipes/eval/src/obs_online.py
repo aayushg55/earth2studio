@@ -22,7 +22,7 @@ observation methodology (reading, quality control, the time window, the
 interpolation to observation points and the per-region scores) is not
 implemented here: it is the ``private.obs_scoring`` package of a HealDA
 checkout (``scoring.online.observations.scorer_root``), whose
-``cycle.cycle_observations`` and ``cycle.score_cycle`` this module calls on
+``score.cycle_observations`` and ``score.score_cycle`` this module calls on
 the in-memory forecast.  That package and its dependencies run in spawned
 worker processes whose import path starts with ``scorer_root``, so they
 cannot clash with packages the forecast process imports, and their CPU work
@@ -247,11 +247,11 @@ def _init_worker(settings: ObservationSettings) -> None:
             f"healda was imported from {loaded.__file__} before the observation "
             f"scorer at {root}; the scorer needs its own checkout's package."
         )
-    from private.obs_scoring import cycle, fields
+    from private.obs_scoring import fields, score
 
     _worker.update(
         settings=settings,
-        cycle=cycle,
+        score=score,
         fields=fields,
         regions=standard_regions(),
         obs={},
@@ -273,7 +273,7 @@ def _cycle_obs(valid: pd.Timestamp) -> pd.DataFrame | None:
     cache = _worker["obs"]
     if valid not in cache:
         s = _worker["settings"]
-        cache[valid] = _worker["cycle"].cycle_observations(
+        cache[valid] = _worker["score"].cycle_observations(
             s.source, valid, s.stations, s.dedupe_surface
         )
         while len(cache) > 64:
@@ -307,7 +307,7 @@ def _score_step(
             data["orography"] = (("lat", "lon"), _orography(lat, lon))
         return xr.Dataset(data, coords={"lat": lat, "lon": lon})
 
-    table, paired = _worker["cycle"].score_cycle(
+    table, paired = _worker["score"].score_cycle(
         fields_at,
         obs,
         valid,
