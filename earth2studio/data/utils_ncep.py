@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
 import pathlib
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -935,6 +937,7 @@ def decode_prepbufr(
     started = time.perf_counter()
     if use_parallel:
         with ProcessPoolExecutor(
+            mp_context=DECODE_MP_CONTEXT,
             max_workers=decode_workers,
             initializer=_init_decode_worker,
             initargs=(table_b, table_d),
@@ -1014,6 +1017,7 @@ def decode_gpsro(
     use_parallel = decode_workers > 1 and len(messages) >= 32
     if use_parallel:
         with ProcessPoolExecutor(
+            mp_context=DECODE_MP_CONTEXT,
             max_workers=decode_workers,
             initializer=_init_decode_worker,
             initargs=(table_b, table_d),
@@ -1059,6 +1063,10 @@ _NCEPObsModifier = Callable[[pd.DataFrame], pd.DataFrame]
 # The key is the raw string after the lexicon "route::" prefix; each adapter
 # interprets it (PrepBUFR mnemonic, or GPS RO descriptor id parsed to int).
 _NCEPPlan = Mapping[str, tuple[str, _NCEPObsModifier]]
+
+
+# Workers start from a clean server process, not a fork of a parent holding decoded frames.
+DECODE_MP_CONTEXT = multiprocessing.get_context("forkserver")
 
 
 @dataclass(frozen=True)
@@ -1278,44 +1286,106 @@ def compile_dataframe(
         when ``decode_task`` raises.  If ``None`` the error is logged and the
         task is skipped.
     """
-    frames: list[pd.DataFrame] = []
     n_tasks = len(tasks)
     compile_t0 = time.perf_counter()
-    for idx, task in enumerate(tasks, start=1):
-        uri = task.uri
-        path = local_path(uri)
-        if not pathlib.Path(path).is_file():
-            logger.warning(f"Cached file missing for {uri}, skipping")
-            continue
-        short_uri = uri.rsplit("/", 1)[-1]
-        logger.info(f"[{source_id}] decode {idx}/{n_tasks} start: {short_uri}")
-        t0 = time.perf_counter()
-        try:
-            df = decode_task(path, task)
-        except Exception as exc:  # pragma: no cover - defensive
-            if on_error is not None:
-                on_error(uri, idx, n_tasks, exc)
-            logger.error(f"Failed to decode {path}: {exc}")
-            continue
-        elapsed = time.perf_counter() - t0
-        if df is None or df.empty:
-            logger.info(
-                f"[{source_id}] decode {idx}/{n_tasks} done : "
-                f"{short_uri} (empty) in {elapsed:.1f}s"
+    frames = [
+        _decode_task_file(
+            idx, n_tasks, task, source_id, local_path, decode_task, on_error
+        )
+        for idx, task in enumerate(tasks, start=1)
+    ]
+    return _assemble_frames(frames, schema, source_id, compile_t0)
+
+
+async def compile_dataframe_async(
+    tasks: Sequence[Any],
+    schema: pa.Schema,
+    source_id: str,
+    local_path: Callable[[str], str],
+    decode_task: Callable[[str, Any], pd.DataFrame],
+    on_error: Callable[[str, int, int, Exception], None] | None = None,
+    max_concurrent_files: int = 4,
+) -> pd.DataFrame:
+    """Decode cached task files concurrently, off the event loop.
+
+    Same contract as :func:`compile_dataframe`, but each file is decoded in a
+    worker thread (its own decode pool runs the BUFR work) so the event loop is
+    never blocked and up to ``max_concurrent_files`` files decode at once.
+    Output rows keep task order.
+    """
+    n_tasks = len(tasks)
+    compile_t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max(1, min(max_concurrent_files, n_tasks))) as pool:
+        frames = await asyncio.gather(
+            *(
+                loop.run_in_executor(
+                    pool,
+                    _decode_task_file,
+                    idx,
+                    n_tasks,
+                    task,
+                    source_id,
+                    local_path,
+                    decode_task,
+                    on_error,
+                )
+                for idx, task in enumerate(tasks, start=1)
             )
-            continue
+        )
+    return _assemble_frames(list(frames), schema, source_id, compile_t0)
+
+
+def _decode_task_file(
+    idx: int,
+    n_tasks: int,
+    task: Any,
+    source_id: str,
+    local_path: Callable[[str], str],
+    decode_task: Callable[[str, Any], pd.DataFrame],
+    on_error: Callable[[str, int, int, Exception], None] | None,
+) -> pd.DataFrame | None:
+    uri = task.uri
+    path = local_path(uri)
+    if not pathlib.Path(path).is_file():
+        logger.warning(f"Cached file missing for {uri}, skipping")
+        return None
+    short_uri = uri.rsplit("/", 1)[-1]
+    logger.info(f"[{source_id}] decode {idx}/{n_tasks} start: {short_uri}")
+    t0 = time.perf_counter()
+    try:
+        df = decode_task(path, task)
+    except Exception as exc:  # pragma: no cover - defensive
+        if on_error is not None:
+            on_error(uri, idx, n_tasks, exc)
+        logger.error(f"Failed to decode {path}: {exc}")
+        return None
+    elapsed = time.perf_counter() - t0
+    if df is None or df.empty:
         logger.info(
             f"[{source_id}] decode {idx}/{n_tasks} done : "
-            f"{short_uri} ({len(df):,} rows) in {elapsed:.1f}s"
+            f"{short_uri} (empty) in {elapsed:.1f}s"
         )
-        df.attrs["source"] = source_id
-        frames.append(df)
+        return None
+    logger.info(
+        f"[{source_id}] decode {idx}/{n_tasks} done : "
+        f"{short_uri} ({len(df):,} rows) in {elapsed:.1f}s"
+    )
+    df.attrs["source"] = source_id
+    return df
 
+
+def _assemble_frames(
+    decoded: list[pd.DataFrame | None],
+    schema: pa.Schema,
+    source_id: str,
+    compile_t0: float,
+) -> pd.DataFrame:
+    frames = [df for df in decoded if df is not None]
     logger.info(
         f"[{source_id}] compile finished: {len(frames)} non-empty "
         f"frames, total {time.perf_counter() - compile_t0:.1f}s"
     )
-
     if not frames:
         result = empty_dataframe(schema)
     else:
@@ -1741,6 +1811,7 @@ def decode_microwave(
     failures = 0
     if decode_workers > 1 and len(batches) > 1:
         with ProcessPoolExecutor(
+            mp_context=DECODE_MP_CONTEXT,
             max_workers=min(decode_workers, len(batches)),
             initializer=_init_decode_worker,
             initargs=(table_b, table_d),
@@ -2227,6 +2298,7 @@ def _yield_ir_batches(
     """
     if decode_workers > 1 and len(arguments) > 1:
         with ProcessPoolExecutor(
+            mp_context=DECODE_MP_CONTEXT,
             max_workers=min(decode_workers, len(arguments)),
             initializer=_init_decode_worker,
             initargs=(table_b, table_d),

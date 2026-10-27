@@ -50,7 +50,7 @@ from earth2studio.data.utils_ncep import (
     NCEP_MICROWAVE_OUTPUT_SCHEMA,
     NCEP_MICROWAVE_SATELLITES,
     NCEPObsTask,
-    compile_dataframe,
+    compile_dataframe_async,
     cycle_windows,
     decode_gpsro,
     decode_ir_sounder,
@@ -328,7 +328,7 @@ class NNJAObsConv:
         tasks = self._create_tasks(time_list, variable_list)
         await self.fetch_files(list({task.uri for task in tasks}))
 
-        return compile_dataframe(
+        return await compile_dataframe_async(
             tasks,
             schema,
             self.SOURCE_ID,
@@ -365,6 +365,8 @@ class NNJAObsConv:
                 key,
                 self.cache,
                 cache_key=hashlib.sha256(path.encode()).hexdigest(),
+                chunked=True,
+                atomic=True,
             )
         except FileNotFoundError:
             self._handle_missing_file(path)
@@ -852,7 +854,7 @@ class NNJAObsSat:
         except Exception as exc:
             self._handle_fetch_failure(uris, exc)
 
-        return compile_dataframe(
+        return await compile_dataframe_async(
             tasks,
             schema,
             self.SOURCE_ID,
@@ -892,6 +894,8 @@ class NNJAObsSat:
                 key,
                 self.cache,
                 cache_key=hashlib.sha256(path.encode()).hexdigest(),
+                chunked=True,
+                atomic=True,
             )
         except FileNotFoundError:
             self._handle_missing_file(path)

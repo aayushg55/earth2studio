@@ -53,6 +53,7 @@ from earth2studio.data.utils_bufr import (
 )
 from earth2studio.data.utils_bufr import silence_bufr_noise as _silence_bufr_noise
 from earth2studio.data.utils_ncep import (
+    DECODE_MP_CONTEXT,
     NCEP_CONVENTIONAL_PUBLIC_SCHEMA,
     _finalize_rows,
     empty_dataframe,
@@ -446,6 +447,7 @@ def decode_satwnd(
     workers = min(max(1, decode_workers), n_batches)
     if workers > 1:
         with ProcessPoolExecutor(
+            mp_context=DECODE_MP_CONTEXT,
             max_workers=workers,
             initializer=init_decode_worker,
             initargs=(table_b, table_d),
