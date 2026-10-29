@@ -123,6 +123,10 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     MODEL_NAME: str
     PARAMS_PATH: str
     SAMPLE_PATH: str
+    SURFACE_INPUT_VARIABLES: list[str] = SURFACE_INPUT_VARIABLES
+    INPUT_VARIABLES: list[str] = INPUT_VARIABLES
+    OUTPUT_VARIABLES: list[str] = OUTPUT_VARIABLES
+    TARGET_VARIABLES: tuple[str, ...] = WN2_TARGET_VARIABLES
 
     def __init__(
         self,
@@ -162,7 +166,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
                 "lead_time": np.array(
                     [np.timedelta64(-6, "h"), np.timedelta64(0, "h")]
                 ),
-                "variable": np.array(INPUT_VARIABLES),
+                "variable": np.array(self.INPUT_VARIABLES),
                 "lat": np.linspace(90, -90, n_lat, endpoint=True),
                 "lon": np.linspace(0, 360, n_lon, endpoint=False),
             }
@@ -172,7 +176,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
                 "batch": np.empty(0),
                 "time": np.empty(0),
                 "lead_time": np.array([np.timedelta64(6, "h")]),
-                "variable": np.array(OUTPUT_VARIABLES),
+                "variable": np.array(self.OUTPUT_VARIABLES),
                 "lat": np.linspace(90, -90, n_lat, endpoint=True),
                 "lon": np.linspace(0, 360, n_lon, endpoint=False),
             }
@@ -394,7 +398,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             else tuple(
                 variable
                 for variable in config.task.target_variables
-                if variable in WN2_TARGET_VARIABLES
+                if variable in self.TARGET_VARIABLES
             )
         )
         return dataclasses.replace(config.task, target_variables=target_variables)
@@ -502,7 +506,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     def iterator_result_to_tensor(self, dataset: xr.Dataset) -> torch.Tensor:
         """Convert an xarray Dataset prediction to an Earth2Studio tensor."""
         dataset = dataset[
-            [var for var in dataset.data_vars if var in WN2_TARGET_VARIABLES]
+            [var for var in dataset.data_vars if var in self.TARGET_VARIABLES]
         ]
         for var in list(dataset.data_vars):
             if "level" in dataset[var].dims:
@@ -525,7 +529,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         dataset = dataset.rename({key: INV_VOCAB[key] for key in dataset.data_vars})
         if "batch" in dataset.dims:
             dataarray = (
-                dataset[OUTPUT_VARIABLES]
+                dataset[self.OUTPUT_VARIABLES]
                 .to_dataarray()
                 .T.transpose(
                     ..., "batch", "time", "lead_time", "variable", "lat", "lon"
@@ -533,7 +537,7 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
             )
         else:
             dataarray = (
-                dataset[OUTPUT_VARIABLES]
+                dataset[self.OUTPUT_VARIABLES]
                 .to_dataarray()
                 .T.transpose(..., "time", "lead_time", "variable", "lat", "lon")
             )
@@ -697,9 +701,9 @@ class _WeatherNext2Base(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         device = x.device
         coords_out = coords.copy()
         coords_out["lead_time"] = coords["lead_time"][1:]
-        coords_out["variable"] = np.array(OUTPUT_VARIABLES)
+        coords_out["variable"] = np.array(self.OUTPUT_VARIABLES)
         initial = x[:, :, 1:, ...]
-        surface_count = len(SURFACE_INPUT_VARIABLES)
+        surface_count = len(self.SURFACE_INPUT_VARIABLES)
         tp06 = torch.zeros_like(initial[..., :1, :, :])
         yield torch.cat(
             (
@@ -1004,3 +1008,50 @@ class WeatherNext2Cyclones(_WeatherNext2Base):
             jit_compile=jit_compile,
             track_cyclones=track_cyclones,
         )
+
+
+WN2_SURFACE_INPUT_VARIABLES = SURFACE_INPUT_VARIABLES + ["u100m", "v100m"]
+WN2_INPUT_VARIABLES = WN2_SURFACE_INPUT_VARIABLES + [
+    f"{var}{level}" for var in ATMOS_VARIABLES for level in PRESSURE_LEVELS
+]
+WN2_OUTPUT_VARIABLES = (
+    WN2_SURFACE_INPUT_VARIABLES
+    + ["tp06"]
+    + [f"{var}{level}" for var in ATMOS_VARIABLES for level in PRESSURE_LEVELS]
+)
+
+
+class WeatherNext2(WeatherNext2Cyclones):
+    """WeatherNext 2 operational medium-range forecast model.
+
+    Google DeepMind's operational 0.25 degree ``WeatherNext2_<2025`` checkpoint
+    family: trained on data through 2024 and fine-tuned on ECMWF HRES analyses,
+    so it is designed to start from operational HRES initial conditions. Four
+    trained checkpoint members are available; ``load_model`` selects member 1 by
+    default. It differs from :class:`WeatherNext2Cyclones` (an independent
+    training run) in its weights and in also taking and predicting 100 m wind
+    (``u100m``, ``v100m``). Inputs, rollout and cyclone tracking are otherwise
+    the same; see :class:`WeatherNext2Cyclones`.
+
+    Note
+    ----
+    For more information see the following references:
+
+    - https://github.com/google-deepmind/weathernext#provided-pretrained-models
+
+    Badges
+    ------
+    region:global class:medium-range product:wind product:precip product:temp product:atmos
+    product:ocean year:2026 gpu:80gb provider:google backend:jax
+    """
+
+    MODEL_NAME = "WeatherNext2"
+    PARAMS_PATH = "params/WeatherNext2_<2025_model{checkpoint_member}.npz"
+    SURFACE_INPUT_VARIABLES = WN2_SURFACE_INPUT_VARIABLES
+    INPUT_VARIABLES = WN2_INPUT_VARIABLES
+    OUTPUT_VARIABLES = WN2_OUTPUT_VARIABLES
+    TARGET_VARIABLES = tuple(
+        dict.fromkeys(
+            WB2Lexicon.VOCAB[var].split("::")[0] for var in WN2_OUTPUT_VARIABLES
+        )
+    )
