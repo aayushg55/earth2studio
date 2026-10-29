@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
-from src.models import load_diagnostics, load_prognostic
+from src.models import load_diagnostics, load_prognostic, resolve_member_load_args
 
 from earth2studio.models.dx import Identity
 from earth2studio.models.px import Persistence
@@ -166,3 +166,23 @@ class TestLoadDiagnostics:
         result = load_diagnostics(cfg)
         assert len(result) == 2
         assert all(isinstance(d, Identity) for d in result)
+
+
+def test_member_load_args_split_members_into_blocks():
+    node = OmegaConf.create(
+        {
+            "load_args": {"seed": 0},
+            "load_args_by_member": {"checkpoint_member": [1, 2, 3, 4]},
+        }
+    )
+    resolve_member_load_args(node, (8, 9, 10, 11), ensemble_size=16)
+    assert dict(node.load_args) == {"seed": 0, "checkpoint_member": 3}
+    assert "load_args_by_member" not in node
+
+
+def test_member_load_args_refuse_a_rank_spanning_blocks():
+    node = OmegaConf.create(
+        {"load_args_by_member": {"checkpoint_member": [1, 2, 3, 4]}}
+    )
+    with pytest.raises(ValueError, match="span blocks"):
+        resolve_member_load_args(node, tuple(range(8)), ensemble_size=16)

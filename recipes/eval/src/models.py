@@ -20,12 +20,49 @@ from typing import Any
 
 import hydra
 from loguru import logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from earth2studio.models.dx import DiagnosticModel
 from earth2studio.models.px import PrognosticModel
 
 from .distributed import run_on_rank0_first
+
+
+def resolve_member_load_args(
+    node: DictConfig, member_ids: tuple[int, ...], ensemble_size: int
+) -> None:
+    """Fold ``load_args_by_member`` into ``load_args`` for this rank's members.
+
+    ``load_args_by_member`` maps a ``load_model`` argument to a list of values;
+    the ensemble's members are split into equal consecutive blocks, one per
+    value, so with ``{checkpoint_member: [1, 2, 3, 4]}`` and 16 members,
+    members 0-3 load checkpoint 1, members 4-7 checkpoint 2, and so on. A rank
+    loads one model, so its members must fall in one block. Removes
+    ``load_args_by_member`` from ``node`` once resolved.
+    """
+    by_member = node.get("load_args_by_member")
+    if not by_member:
+        return
+    resolved = {}
+    for name, values in by_member.items():
+        values = list(values)
+        if ensemble_size % len(values):
+            raise ValueError(
+                f"load_args_by_member.{name}: {len(values)} values do not split "
+                f"{ensemble_size} members evenly"
+            )
+        blocks = {m * len(values) // ensemble_size for m in member_ids}
+        if len(blocks) != 1:
+            raise ValueError(
+                f"load_args_by_member.{name}: members {list(member_ids)} of this "
+                f"rank span blocks {sorted(blocks)}; choose an ensemble layout "
+                "whose ranks hold members of one block"
+            )
+        resolved[name] = values[blocks.pop()]
+    with open_dict(node):
+        node.load_args = {**dict(node.get("load_args") or {}), **resolved}
+        del node["load_args_by_member"]
+    logger.info(f"members {list(member_ids)}: load_args {resolved}")
 
 
 def load_prognostic(
@@ -69,6 +106,9 @@ def load_prognostic(
         pkg = run_on_rank0_first(cls.load_default_package)
 
     load_kwargs: dict[str, Any] = dict(model_cfg.get("load_args", {}))
+    # Unresolved (a model loaded only for its coordinates): the first value.
+    for name, values in (model_cfg.get("load_args_by_member") or {}).items():
+        load_kwargs.setdefault(name, list(values)[0])
     model: PrognosticModel = cls.load_model(package=pkg, **load_kwargs)
 
     logger.success(f"Loaded prognostic model: {cls.__name__}")

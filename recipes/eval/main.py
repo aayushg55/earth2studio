@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 from physicsnemo.distributed import DistributedManager
 from src.data import resolve_ic_source
 from src.distributed import configure_logging
+from src.models import resolve_member_load_args
 from src.obs_online import (
     ObservationScorer,
     WithObservations,
@@ -59,6 +60,12 @@ from src.work import (
     filter_completed_items,
     filter_online_completed,
 )
+
+
+def _model_node(pipeline: Pipeline, cfg: DictConfig) -> DictConfig:
+    """The config node of the pipeline's prognostic model (``cfg.model`` by default)."""
+    node = getattr(pipeline, "_model_node", None)
+    return node(cfg) if node is not None else cfg.model
 
 
 @hydra.main(version_base=None, config_path="cfg", config_name="default")
@@ -137,6 +144,11 @@ def _run_offline(
 
     my_items = distribute_work(remaining_items, dist.rank, dist.world_size)
 
+    if _model_node(pipeline, cfg).get("load_args_by_member"):
+        raise ValueError(
+            "model.load_args_by_member needs scoring.online: only online runs "
+            "give each rank a fixed block of ensemble members"
+        )
     pipeline.setup(cfg, device)
 
     # Use all_items for coord building so the zarr schema always covers the
@@ -244,6 +256,10 @@ def _run_online(
         my_items = build_group_work_items(my_times, comm.group, cfg)
 
     # --- Pipeline setup -----------------------------------------------------
+    if comm is not None:
+        resolve_member_load_args(
+            _model_node(pipeline, cfg), comm.group.member_ids, ensemble_size
+        )
     pipeline.setup(cfg, device)
 
     scoring_variables = list(cfg.scoring.variables)
