@@ -1,10 +1,8 @@
 # Observation verification: every step, filter and correction
 
 What happens to an observation between the NNJA-AI file and a number in a figure, and why. It
-covers analyses (`private/scripts/analysis/obs_scores.py`) and forecasts (online scoring in the
-earth2studio eval recipe, figures by `private/scripts/campaign/obs_figures.py`). Module-level
-detail and the command lines are in `README.md` beside this file; the campaign side is in
-`private/scripts/campaign/README.md`, "Observation-verified runs".
+covers analyses (`cli.py`) and forecasts (online scoring in `src/obs_online.py`, figures by
+`figures.py`). Module-level detail and the command lines are in `README.md` beside this file.
 
 The scorer's defaults follow NOAA PSL eagle-tools `obs-metrics`, so default scores can be
 compared with it. Every step that departs from eagle-tools is optional and named in the output
@@ -21,7 +19,7 @@ draw one of two protocols, `ecmwf` (default) and `eagle` (section 6).
 | surface, METAR | `conv-adpsfc-NC000007` | `tas`, `uas`, `vas`, `sfcwind` (no pressure or dewpoint) |
 | surface, BUFR SYNOP | `conv-adpsfc-NC000101` | `tas`, `sp`, `uas`, `vas`, `sfcwind`, `q2m` |
 
-`obs_scores.py fetch` mirrors the day files unchanged into `NNJA_AI_MIRROR`; every rule below is
+`cli.py fetch` mirrors the day files unchanged into `NNJA_AI_MIRROR`; every rule below is
 applied when they are read, so a rule change needs no new download. Campaign jobs have no
 network: `fetch --config <campaign config>` fetches the days a run scores, and
 `run_campaign.sh` runs it with `--check` to stop a run whose days are missing.
@@ -47,7 +45,7 @@ Nothing else is screened on read: no range check, no background check, no duplic
 | --- | --- | --- |
 | radiosonde height | `GP10` / 9.8 (not 9.80665) | NCEP encodes reported gpm × 9.8; checked three ways (`README.md`, Validation) |
 | winds | speed and direction to `u = -s sin(d)`, `v = -s cos(d)`; speed kept as `S{p}` / `sfcwind` | |
-| humidity | dewpoint to specific humidity with the Magnus formula at the level pressure (radiosondes) or the reported station pressure (surface); no `q2m` without a station pressure | `healda.utils.thermo.specific_humidity_from_dewpoint` |
+| humidity | dewpoint to specific humidity with the Magnus formula at the level pressure (radiosondes) or the reported station pressure (surface); no `q2m` without a station pressure | `thermo.specific_humidity_from_dewpoint` |
 | longitude | to [0, 360) | |
 | time | `OBS_TIMESTAMP` as UTC | NNJA-AI truncates radiosonde times to the hour (section 4) |
 
@@ -84,7 +82,7 @@ the 06/18 UTC points are a different, small station set and alternate with the 0
 - Radiosondes: the model's value on the same pressure level at the station position and report
   time; no vertical interpolation and no balloon drift (the NNJA-AI table has no per-level
   position). Balloons drift a median ~25 km and up to ~200 km, so upper-level errors include
-  that displacement (`private/docs/radiosonde_drift.md`).
+  that displacement.
 - `tas`: the model's 2 m temperature at the model terrain height, unless corrected (section 6).
 - `q2m`: from the model's `d2m` and `sp`, as for the observation.
 - `sfcwind` and `S{p}`: the speed of the interpolated `u`, `v`.
@@ -95,7 +93,7 @@ Forecasts are scored inside the run at every 6 h lead step, at valid time init +
 storing the forecast. Each run writes per-report pairs (`obs_scores/pairs`) and per-region
 score tables (`obs_scores/parts`).
 
-## 6. Processing for the figures (`obs_figures.py`)
+## 6. Processing for the figures (`figures.py`)
 
 `accumulate` computes every variant below side by side; `plot` and `scorecards` draw one
 protocol, so switching never needs a rerun.
@@ -147,7 +145,7 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
    - `lapse6.5_win250`: only reports with |change| <= 250 m (reports without an elevation,
      0.2-0.3 % of `tas` reports, ~500-600 stations in 2025-26, are outside), and the model
      moved to the station elevation, `tas - 0.0065 K/m × change`
-     (`healda.utils.thermo.temperature_at_height`). The shift is identical for every IC
+     (`thermo.temperature_at_height`). The shift is identical for every IC
      source: all of them are forecast by the same model. The terrain a model's 2 m temperature
      refers to depends on its training data; the ERA5 terrain is used for every model, which is
      exact only for one trained on ERA5.
@@ -181,7 +179,7 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
    the median over IC sources of model - obs; a report is dropped when
    |c - median(c)| > 5 × 1.4826 × median(|c - median(c)|). Computed separately for each `match`
    and 2 m temperature variant. The analyses' lead 0 uses the same rule per field and cycle,
-   as does `obs_scores.py compare --gross`.
+   as does `cli.py compare --gross`.
    - Why: NNJA-AI passes reports that are grossly wrong for every model (section 7). In 2025
      they dominate the radiosonde RMSE: global Z250 RMSE is ~75-90 m at every lead without the
      check and rises from 14 to 41 m with it (WN2), and the upper-air curves alternate by lead

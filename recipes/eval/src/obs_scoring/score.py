@@ -3,20 +3,24 @@
 """Scores of model values against observations, per region and field, and of one cycle:
 the observations valid at a time scored against the fields for that time.
 
-``obs_scores score`` reads the fields from a store; a caller that holds them in memory (a
+``cli score`` reads the fields from a store; a caller that holds them in memory (a
 forecast at each lead step, for example) passes its own ``fields_at``.
 """
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from private.obs_scoring import observations
-from private.obs_scoring.sample import required_fields, sample
+from . import observations
+from .sample import required_fields, sample
+
+STANDARD_REGIONS = Path(__file__).parents[2] / "scorecard/cfg/regions/standard.yaml"
 
 UNITS = {
     "Z": "m",
@@ -36,6 +40,18 @@ UNITS = {
 
 def field_units(field: str) -> str:
     return UNITS.get(field, UNITS.get(field[:1], ""))
+
+
+@functools.cache
+def standard_regions() -> dict:
+    """The forecast scorecard's standard regions plus ``global``."""
+    import yaml
+
+    from ..regions import parse_regions
+
+    return parse_regions(
+        {"global": None, **yaml.safe_load(STANDARD_REGIONS.read_text())}
+    )
 
 
 def point_regions(regions: dict, lat, lon) -> tuple[list[str], np.ndarray]:
@@ -71,7 +87,7 @@ def score(
 ) -> pd.DataFrame:
     """RMSE, MAE, bias and count of ``model - obs`` per region and per ``by`` group.
 
-    ``regions`` is a parsed region table (``region_masks.load_regions``); observations are
+    ``regions`` is a parsed region table (``standard_regions``); observations are
     assigned by their own position. Without it everything is ``global``. ``by`` must end
     with ``"field"``; ``("dataset", "field")`` splits by observation dataset.
     """

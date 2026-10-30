@@ -408,7 +408,7 @@ All scripts and outputs are in `my/obs_quality/`.
 
 | script | does | outputs |
 | --- | --- | --- |
-| `inventory.py` | per init: the four IC sources' pairs, the same alignment, fields and check as `obs_figures.py` (`report.consensus_keep`, synoptic match, `tas` uncorrected) | `inventory/<year>_<model>/` removed, small-group and kept-large entries; per station and per field sums |
+| `inventory.py` | per init: the four IC sources' pairs, the same alignment, fields and check as `figures.py` (`report.consensus_keep`, synoptic match, `tas` uncorrected) | `inventory/<year>_<model>/` removed, small-group and kept-large entries; per station and per field sums |
 | `report.py` | tables above; ERA5 lead-0 pairs at the same reports | `report_<tag>.txt`, `csv/` |
 | `station_lookup.py` | per-field detail of named stations | `station_lookup_*.txt` |
 | `station_families.py` | removed reports per field family of named stations | `station_families.txt` |
@@ -527,7 +527,7 @@ All scripts and outputs are in `my/obs_quality/`.
 | provider marks | PrepBUFR marks after CQC/OIQC; GSI drops ≥ 4 or ≥ 8 [8, 11] | NNJA-AI v1 has only dump marks; > 2 dropped, missing kept | only SDM purges (14) are removed; the 20674 winds of 2025-12-18 pass with no mark |
 | hydrostatic / baseline check | CQCHT [4, 5] | none | West African soundings without mandatory temperatures have nothing to check against; they are 60-67 % of Z500 reports > 200 m from ERA5 |
 | background check | ECMWF 5σ-type limits [14]; GSI gross 8 [12]; WMO: exclude what the analysis rejects [25] | none on read; ERA5 15 K screen for `tas` only (optional) | reports 500-5,000 m off stay in unscreened scores: 2026 Z500 65.4 m vs 19.4 m |
-| check in the figures | | consensus 5-MAD over the compared IC sources, per field and valid time (protocol `ecmwf`; `obs_scores.py compare --gross`) | removes 1.1-3.3 % of Z entries; misses West African soundings in 06/18 UTC groups of ~6 (98 kept in 2026); removes persistent moderate offsets (23933, 29839: 50-125 m) and representativeness departures (mountain `tas`, wind), which ERA5 alone does not always flag (46-58 % overall; 1-17 % at 70026, 10393, 47102) |
+| check in the figures | | consensus 5-MAD over the compared IC sources, per field and valid time (protocol `ecmwf`; `cli.py compare --gross`) | removes 1.1-3.3 % of Z entries; misses West African soundings in 06/18 UTC groups of ~6 (98 kept in 2026); removes persistent moderate offsets (23933, 29839: 50-125 m) and representativeness departures (mountain `tas`, wind), which ERA5 alone does not always flag (46-58 % overall; 1-17 % at 70026, 10393, 47102) |
 | station blocklist / monitoring | monthly lists [14, 19, 20]; WMO suspect lists [25] | none | 61052, 65503, 61024, 89859, 93988 (2025), 61966, 48698 recur all period |
 | common radiosonde list | WMO verification list [25, 26] | every NC002001 station | station set differs by year and hour (571-786 stations) |
 | VarQC / Huber | assimilation only [15, 18] | n/a | |

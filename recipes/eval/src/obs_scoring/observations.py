@@ -15,12 +15,13 @@ from __future__ import annotations
 import functools
 import multiprocessing
 import pathlib
+import zlib
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from healda.utils.thermo import specific_humidity_from_dewpoint
+from .thermo import specific_humidity_from_dewpoint
 
 WINDOW = pd.Timedelta("30min")
 # NNJA-AI radiosonde stamps are whole hours; many soundings for t are stamped t - 1 h
@@ -229,7 +230,7 @@ def _fetch_day(task) -> str:
     else:
         import fsspec
 
-        gcs = fsspec.filesystem("gcs", token="anon")
+        gcs = fsspec.filesystem("gcs", token="anon")  # noqa: S106 (anonymous access)
         for source in manifest.loc[[key], "file"]:
             gcs.get(source, str(staging / pathlib.PurePosixPath(source).name))
     staging.rename(target)
@@ -263,7 +264,9 @@ def _read_raw(
 ) -> pd.DataFrame | None:
     folder = raw_day_dir(cache, dataset, day)
     if not folder.exists():
-        raise FileNotFoundError(f"{folder} not fetched; run obs_scores fetch")
+        raise FileNotFoundError(
+            f"{folder} not fetched; run python -m src.obs_scoring.cli fetch"
+        )
     files = sorted(folder.glob("*.parquet"))
     if not files:
         return None
@@ -425,13 +428,27 @@ def dedupe_surface(obs: pd.DataFrame) -> pd.DataFrame:
     return obs.drop(index=duplicate).reset_index(drop=True)
 
 
+# Share of stations a training run withholds, chosen by the crc32 of the station id.
+HOLDOUT_PERCENT = 10
+
+
+def is_withheld(station_ids) -> np.ndarray:
+    codes, unique = pd.factorize(
+        pd.Series(station_ids, dtype=object), use_na_sentinel=False
+    )
+    keys = ["" if pd.isna(s) else str(s).strip().upper() for s in unique]
+    flags = np.array(
+        [bool(k) and zlib.crc32(k.encode()) % 100 < HOLDOUT_PERCENT for k in keys],
+        dtype=bool,
+    )
+    return flags[codes]
+
+
 def station_mask(obs: pd.DataFrame, stations: str) -> np.ndarray:
     """Rows of ``stations`` ("all", "withheld", "kept"): withheld are the radiosonde and
-    surface-station rows whose station the loader's holdout drops (``is_withheld``)."""
+    surface-station rows whose station a training holdout drops (``is_withheld``)."""
     if stations == "all":
         return np.ones(len(obs), dtype=bool)
-    from healda.observations.loaders.nnja_conventional import is_withheld
-
     conventional = obs["dataset"].str.startswith("conv-").to_numpy()
     withheld = conventional & is_withheld(obs["station"].to_numpy())
     return withheld if stations == "withheld" else ~withheld

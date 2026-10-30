@@ -1,24 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Figures of an observation-scored experiment, from the forecast pairs its runs wrote.
+"""Forecast scores against observations pooled over many inits, from the per-report pairs
+online observation scoring writes (``scoring.online.observations`` with ``pairs: true``).
+From ``recipes/eval``:
 
-    python private/scripts/campaign/obs_figures.py accumulate <experiment> --model M \\
-        [--analysis-pairs DIR | NAME=FILE ...] [--workers N]
-    python private/scripts/campaign/obs_figures.py plot <experiment> --model M \\
-        [--protocol ecmwf|eagle] [--no-gross]
-    python private/scripts/campaign/obs_figures.py scorecards <experiment> --model M [same options]
-    python private/scripts/campaign/obs_figures.py stations <experiment> --model M --leads 24 120
+    python -m src.obs_scoring.figures accumulate --out DIR --ic NAME=RUN_DIR[,RUN_DIR...] ... \\
+        [--reference NAME] [--analysis-pairs DIR | NAME=FILE ...] [--workers N]
+    python -m src.obs_scoring.figures plot --out DIR --ic ... [--protocol ecmwf|eagle] [--no-gross]
+    python -m src.obs_scoring.figures scorecards --out DIR --ic ... [same options]
 
-Output: $E2S_CAMPAIGN_RUNS_ROOT/_figures/<experiment>/obs/<model>_<cycles>/.
-
-accumulate writes error sums per field, region, lead and init day for every radiosonde
-time match, gross check and 2 m temperature variant (sums/forecast.parquet); with
---analysis-pairs (obs_scores.py score --pairs output: a directory of <ic source>.parquet,
-or NAME=FILE) also the analyses' own lead-0 fit at 00/12 UTC (sums/analysis_upper.parquet).
-plot (tables, summary, curves, 2 m temperature bias) and scorecards draw one protocol
-from the sums; the file names end in _<protocol> (and _nogross). stations: per-station
-maps and the European heatwave figure (station_figures.py). The protocols, every
-processing step and the sums layout: private/obs_scoring/METHOD.md section 6.
+Every ``--ic`` names one initial-condition source and the run directories of its forecasts
+(``RUN_DIR/obs_scores/pairs/all/*/*.parquet``); all sources must be forecasts of the same
+model from the same inits. accumulate writes error sums per field, region, lead and init day
+for every radiosonde time match, gross check and 2 m temperature variant
+(DIR/sums/forecast.parquet); with --analysis-pairs (``cli score --pairs`` output: a
+directory of <ic source>.parquet, or NAME=FILE) also the analyses' own lead-0 fit at 00/12
+UTC (DIR/sums/analysis_upper.parquet). plot (tables, summary, curves, 2 m temperature bias)
+draws one protocol from the sums, file names ending in _<protocol> (and _nogross);
+scorecards writes per IC source and region netCDF files of RMSE by field, lead and day
+for a scorecard plotter. The protocols, every processing step and the sums layout:
+METHOD.md section 6.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ import concurrent.futures
 import functools
 import json
 import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,22 +36,14 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-import yaml
-from samples import REPO_ROOT, require, segments
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(HERE.parent / "era5_e2e" / "paper_plots"))
-from healda.utils.thermo import temperature_at_height  # noqa: E402
-from private.obs_scoring import fields as era5_grid  # noqa: E402
-from private.obs_scoring.observations import within  # noqa: E402
-from private.obs_scoring.report import check_same_reports, consensus_keep  # noqa: E402
-from private.obs_scoring.sample import station_height_change  # noqa: E402
-from private.obs_scoring.score import point_regions  # noqa: E402
-from private.scripts.region_masks import load_regions  # noqa: E402
+from . import fields as era5_grid
+from .observations import within
+from .report import check_same_reports, consensus_keep
+from .sample import station_height_change
+from .score import point_regions, standard_regions
+from .thermo import temperature_at_height
 
-CFG = HERE / "cfg"
-RUN_NAME = "{experiment}__{model}__{ic}__{sample}"
 PAIRS_GLOB = "obs_scores/pairs/all/*/*.parquet"
 # q2m has a few reports with very large errors; it stays in sums and tables.
 SURFACE_PLOTTED = ["tas", "sfcwind"]
@@ -63,9 +55,9 @@ UPPER = [f"{v}{p}" for v in "TZUV" for p in ALL_LEVELS] + [
     f"Q{p}" for p in Q_ALL_LEVELS
 ]
 FIELDS = UPPER + ["tas", "q2m", "sfcwind", "uas", "vas"]
-# Surface fields under the names the paper plotters use.
+# Surface fields under the names of the scorecard metrics files.
 SCORECARD_SURFACE = {"tas": "t2m", "sfcwind": "ws10m"}
-# Figure name -> the scorer's standard region (region_masks.load_regions).
+# Figure name -> the scorer's standard region (score.standard_regions).
 REGIONS = {
     "global": "global",
     "NH": "northern_hemisphere",
@@ -127,40 +119,31 @@ SUMMARY = [
 
 
 class Experiment:
-    """The experiment's IC sources (label, colour, pairs files) for one model and cycle
-    group, and where its figures go."""
+    """The IC sources (label, colour, pairs files) of one model's forecasts, and where the
+    sums and figures go."""
 
     def __init__(self, a):
-        from figures import NICE
+        import matplotlib
 
-        exp = yaml.safe_load((CFG / "experiments" / f"{a.experiment}.yaml").read_text())
-        sample = a.samples or (exp["cycles"][0] if len(exp["cycles"]) == 1 else None)
-        if sample is None:
-            raise SystemExit(f"--samples: one of {exp['cycles']}")
-        runs = Path(require("E2S_CAMPAIGN_RUNS_ROOT"))
+        colors = matplotlib.colormaps["tab10"].colors
         self.systems, self.files = {}, {}
-        for ic in exp["ic_sources"]:
-            style = yaml.safe_load((CFG / "ic_sources" / f"{ic}.yaml").read_text())
-            # runs_from, as in figures.py: the experiment holding this source's runs.
-            holder = exp.get("runs_from", {}).get(ic, a.experiment)
-            cell = RUN_NAME.format(
-                experiment=holder, model=a.model, ic=ic, sample=sample
-            )
-            dirs = segments(runs, cell)
-            files = sorted(f for d in dirs for f in d.glob(PAIRS_GLOB))
+        for item in a.ic:
+            name, _, dirs = item.partition("=")
+            files = sorted(f for d in dirs.split(",") for f in Path(d).glob(PAIRS_GLOB))
             if not files:
-                print(f"{ic}: no pairs under {[str(d) for d in dirs]}; left out")
+                print(f"{name}: no pairs under {dirs}; left out")
                 continue
-            self.systems[ic] = (style["label"], style["color"])
-            self.files[ic] = files
+            self.systems[name] = (name, colors[len(self.systems) % len(colors)])
+            self.files[name] = files
         if len(self.systems) < 2:
             raise SystemExit("fewer than two IC sources have pairs")
-        refs = [r for r in exp["scoring_references"] if r in self.systems]
-        self.reference = refs[0] if refs else next(iter(self.systems))
+        self.reference = (
+            a.reference if a.reference in self.systems else a.ic[0].split("=")[0]
+        )
         self.first = next(iter(self.systems))
-        self.model = NICE.get(a.model, a.model)
-        self.lead_hours = exp["run"]["lead_hours"]
-        self.out = runs / "_figures" / a.experiment / "obs" / f"{a.model}_{sample}"
+        self.model = a.model
+        self.lead_hours = a.lead_hours
+        self.out = Path(a.out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.protocol = getattr(a, "protocol", "ecmwf")
         chosen = dict(PROTOCOLS[self.protocol])
@@ -214,7 +197,7 @@ class Experiment:
 
 @functools.cache
 def figure_regions():
-    standard = load_regions()
+    standard = standard_regions()
     return {name: standard[key] for name, key in REGIONS.items()}
 
 
@@ -790,7 +773,7 @@ def mode_plot(e, a):
 
 
 def scorecard_metrics(e, regions):
-    """One forecast metrics file per IC and region, in the paper plotters' layout:
+    """One forecast metrics file per IC and region, for a scorecard plotter:
     ``rmse_member(field, lead_time)`` and ``rmse_member_timeseries(field, time,
     lead_time)`` with one time per init day."""
     import xarray as xr
@@ -835,63 +818,9 @@ def scorecard_metrics(e, regions):
 
 
 def mode_scorecards(e, a):
-    from data_utils import load_metrics
-    from plot_forecast_scorecard import plot_scorecard
-
     regions = list(REGIONS) if a.regions == ["all"] else a.regions
-    paths = scorecard_metrics(e, regions)
-    out = e.out / "scorecards"
-    out.mkdir(exist_ok=True)
-    comparisons = [(s, e.reference) for s in e.others] + e.pairs
-    for region in regions:
-        for s, b in comparisons:
-            path = out / f"{s}_vs_{b}_{region.replace(' ', '_')}{e.suffix}.png"
-            plot_scorecard(
-                load_metrics(paths[region, s]),
-                load_metrics(paths[region, b]),
-                "rmse_member",
-                f"{e.label(s)} IC",
-                f"{e.label(b)} IC",
-                path,
-                max_lead_time=e.lead_hours,
-                vmax_percentile=a.vmax_percentile,
-                skip_t0=True,
-                verification_label=f"protocol {e.protocol}, {region}",
-                significance_alpha=0.05,
-                panel_titles={"W": "vector wind"},
-            )
-            print(path)
-
-
-def mode_stations(e, a):
-    from private.scripts.analysis.station_figures import (
-        plot_heatwave,
-        plot_maps,
-        station_table,
-    )
-
-    out = e.out / "stations"
-    out.mkdir(exist_ok=True)
-    for lead in a.leads:
-        table = station_table(e.files, filters=[("lead", "==", lead)])
-        tag = f"{lead:03d}h"
-        what = f"{e.model} +{lead} h forecasts from {e.systems_label()}"
-        plot_maps(
-            table,
-            e.systems,
-            e.first,
-            out / f"station_rmse_maps_{tag}.png",
-            f"{what} vs surface stations at valid time: same reports for every IC "
-            "(stations with >= 100 reports mapped)",
-            "valid hour (UTC)",
-        )
-        plot_heatwave(
-            table,
-            e.systems,
-            out / f"europe_heatwave_{tag}.png",
-            f"Europe: {what} vs surface stations at valid time (2 m temperature), "
-            "same reports for every IC",
-        )
+    for path in scorecard_metrics(e, regions).values():
+        print(path)
 
 
 def main() -> None:
@@ -899,11 +828,19 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     sub = p.add_subparsers(dest="mode", required=True)
-    for mode in ("accumulate", "plot", "scorecards", "stations"):
+    for mode in ("accumulate", "plot", "scorecards"):
         q = sub.add_parser(mode)
-        q.add_argument("experiment")
-        q.add_argument("--model", required=True, help="model key of the experiment")
-        q.add_argument("--samples", help="cycle group; needed if there are several")
+        q.add_argument("--out", required=True, help="directory for sums and figures")
+        q.add_argument(
+            "--ic",
+            action="append",
+            required=True,
+            metavar="NAME=RUN_DIR[,RUN_DIR...]",
+            help="an IC source and its runs' directories; repeat per source",
+        )
+        q.add_argument("--reference", help="IC source the others are compared with")
+        q.add_argument("--model", default="forecast", help="model name in titles")
+        q.add_argument("--lead-hours", type=int, default=240)
         if mode == "accumulate":
             q.add_argument("--analysis-pairs", nargs="+", metavar="DIR|NAME=FILE")
             q.add_argument(
@@ -918,7 +855,7 @@ def main() -> None:
                 choices=list(PROTOCOLS),
                 default="ecmwf",
                 help="radiosonde match, gross check and 2 m temperature variant "
-                "(private/obs_scoring/METHOD.md section 6)",
+                "(METHOD.md section 6)",
             )
             q.add_argument(
                 "--no-gross",
@@ -926,24 +863,20 @@ def main() -> None:
                 help="the protocol without the consensus gross check",
             )
         if mode == "scorecards":
-            q.add_argument("--vmax-percentile", type=float, default=95.0)
             q.add_argument(
                 "--regions",
                 nargs="+",
                 choices=[*REGIONS, "all"],
                 default=["global"],
                 metavar="REGION",
-                help=f"regions to draw, or all ({', '.join(REGIONS)})",
+                help=f"regions to write, or all ({', '.join(REGIONS)})",
             )
-        if mode == "stations":
-            q.add_argument("--leads", nargs="+", type=int, default=[24, 120])
     a = p.parse_args()
     e = Experiment(a)
     {
         "accumulate": mode_accumulate,
         "plot": mode_plot,
         "scorecards": mode_scorecards,
-        "stations": mode_stations,
     }[a.mode](e, a)
 
 

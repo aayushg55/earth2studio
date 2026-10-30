@@ -3,7 +3,7 @@
 """Model values at observation points.
 
 ``fields`` is an ``xr.Dataset`` for one time with ``lat`` and ``lon`` coordinates on a regular
-grid and variables named like the HealDA channels (``Z500``, ``T850``, ``tas``, ``d2m``, ...),
+grid and variables named as the keys of ``fields.E2S_NAMES`` (``Z500``, ``T850``, ``tas``, ``d2m``),
 ``Z{p}`` as geopotential (m2 s-2). Any source that can produce that can be scored; a HEALPix
 store, for example, after regridding to lat-lon.
 
@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from healda.utils.thermo import (
+from .thermo import (
     GRAVITY,
     pressure_at_height,
     specific_humidity_from_dewpoint,

@@ -1,4 +1,4 @@
-# Observation-space scoring (`private/obs_scoring`)
+# Observation-space scoring (`src/obs_scoring`)
 
 Scores gridded fields against conventional observations: radiosondes, surface stations, NEXRAD
 VAD winds and aircraft winds. Any field can be scored; several systems scored on the same
@@ -14,20 +14,19 @@ import pathlib
 
 import pandas as pd
 
-from private.obs_scoring import fields, observations
-from private.obs_scoring.sample import required_fields, sample
-from private.obs_scoring.score import score
-from private.scripts import region_masks
+from src.obs_scoring import fields, observations  # from recipes/eval
+from src.obs_scoring.sample import required_fields, sample
+from src.obs_scoring.score import score, standard_regions
 
 t = pd.Timestamp("2025-07-08T00")
-mirror = pathlib.Path("MIRROR")          # written by `obs_scores fetch`
+mirror = pathlib.Path("MIRROR")  # written by `cli fetch`
 obs = observations.conventional_obs(mirror, t)
 # or: observations.prepbufr_obs(ARCHIVE, t, "vad")   (NNJA PrepBUFR parquet archive)
 
-store = fields.open_fields("zarr:ANALYSIS.zarr")    # or "era5", "wb2:PATH", or your own source
-values = store.at(t, required_fields(obs))          # xr.Dataset with lat, lon coords
-regions = region_masks.load_regions()
-table = score(obs, sample(values, obs), regions)                          # per region, field
+store = fields.open_fields("zarr:ANALYSIS.zarr")  # or "h5:ROOT", "arco"
+values = store.at(t, required_fields(obs))  # xr.Dataset with lat, lon coords
+regions = standard_regions()
+table = score(obs, sample(values, obs), regions)  # per region, field
 by_dataset = score(obs, sample(values, obs), regions, by=("dataset", "field"))
 ```
 
@@ -39,15 +38,15 @@ variables `sample` reads (`d2m` and `sp` for `q2m`, `U`/`V` for wind speed).
 | `observations` | observation tables (one row per value: `time, lat, lon, station, dataset, field, obs`, plus `pressure, height` for profile winds); NNJA-AI (from the raw mirror `fetch` writes) and PrepBUFR sources; quality control and unit conversion on read |
 | `sample` | `required_fields(obs)` and `sample(fields, obs)`: model value per observation row |
 | `score` | `score(obs, values, regions, by=("field",))`: RMSE, MAE, bias and count per region and `by` group |
-| `fields` | sources for our stores: `open_fields("zarr:PATH" \| "era5" \| "wb2:PATH").at(t, names)` |
+| `fields` | sources for our stores: `open_fields("zarr:PATH" \| "h5:ROOT[:ROOT...]" \| "arco").at(t, names)` |
 | `report` | pooling over times, pairs across systems, gross check, profile plot |
 
 `fields` is an `xr.Dataset` for one time with `lat`/`lon` coordinates on a regular grid and
-variables named like the HealDA channels (`Z500`, `T850`, `tas`, `d2m`, ...; `Z` as
+variables named as the keys of `fields.E2S_NAMES` (`Z500`, `T850`, `tas`, `d2m`; `Z` as
 geopotential). Any source that produces this can be scored; a HEALPix store after
 regridding to lat-lon (earth2grid), for example.
 
-## Command line (`private/scripts/analysis/obs_scores.py`)
+## Command line (`cli.py`)
 
 For each 6-hourly analysis time t:
 
@@ -92,9 +91,9 @@ Systems (`score --system NAME=KIND`):
 
 | kind | reads |
 | --- | --- |
-| `zarr:PATH` | a lat-lon zarr store with one `(time, lat, lon)` array per field, named as in HealDA (our analysis stores, `ifs_hres_t0_025.zarr`). Times with `run_id < 0` and fields with `is_valid` false are skipped. |
-| `era5` | the ERA5 hourly packs named in `.env` |
-| `wb2:PATH` | a WeatherBench2-layout store (CF names, `level` dimension) |
+| `zarr:PATH` | a lat-lon zarr store with one `(time, lat, lon)` array per field, named as the keys of `fields.E2S_NAMES` (`Z500`, `tas`). Times with `run_id < 0` and fields with `is_valid` false are skipped. |
+| `h5:ROOT[:ROOT...]` | ERA5 HDF5 packs: per directory a `YYYY.h5` per year with a `(time, channel, lat, lon)` dataset and a `metadata/data.json` sidecar (`h5_path`, `dhours`, `coords.channel` in earth2studio names); a field is read from the first directory that has it. Fast for a local copy. |
+| `arco` | ERA5 from earth2studio's ARCO source (Google Cloud), one request per time; slow, needs no local data |
 
 Units: `Z` in gpm, `T`/`tas` K, winds m/s, `Q`/`q2m` kg/kg, `sp` Pa.
 
@@ -108,10 +107,10 @@ They follow NOAA PSL eagle-tools `obs-metrics`:
   ~200 km (99th percentile), so upper-level errors include this displacement. Drifted
   positions exist in PrepBUFR (`XDR`, `YDR`, `HRDR`): copied from the measured drift for
   stations that report in BUFR, and estimated from the reported winds with a 5 m/s ascent
-  rate for stations that report only in the text format. See `private/docs/radiosonde_drift.md`;
+  rate for stations that report only in the text format.;
 - surface stations with no elevation correction (see `--elevation-correct` below);
 - a value is dropped when its quality mark is > 2, and a missing mark is kept;
-- dewpoint becomes specific humidity with the Magnus formula (`healda.utils.thermo`).
+- dewpoint becomes specific humidity with the Magnus formula (`thermo.py`).
 
 One deviation: observed radiosonde geopotential `GP10` is divided by 9.8, the factor NCEP
 encodes it with, not 9.80665.
@@ -151,8 +150,8 @@ comparable with eagle-tools.
   the station elevation before comparing. `tas` uses the standard lapse rate (6.5 K/km);
   `sp` is hydrostatic through the layer between them, at the virtual temperature of the
   model's 2 m temperature minus the lapse rate over half the height change and its 2 m
-  humidity (`healda.utils.thermo.pressure_at_height`). The
-  terrain is ERA5's (`fields.era5_orography`) for every system; for IFS HRES, whose `sp`
+  humidity (`thermo.pressure_at_height`). The
+  terrain is ERA5's (`fields.era5_orography`, from ARCO) for every system; for IFS HRES, whose `sp`
   refers to its own finer terrain, that is an approximation. Station elevation is `SELV`;
   the 9999 sentinel counts as missing and such rows are not corrected. Without it, raw `sp`
   is dominated by the terrain mismatch (RMSE 2-4 kPa).
@@ -163,7 +162,7 @@ comparable with eagle-tools.
 ## Comparing systems
 
 - `--region`: any of the 17 regions of the earth2studio eval recipe
-  (`third_party/earth2studio/recipes/eval/scorecard/cfg/regions/standard.yaml`). These are
+  (`scorecard/cfg/regions/standard.yaml`). These are
   the same regions as the forecast scorecards. Observations are assigned by their own
   position.
 - `--gross K`: rescores from the pairs on the observations every system has. It drops an
@@ -181,34 +180,39 @@ Pairs must hold the same observations for every system; `compare` refuses otherw
 
 ## Station holdout
 
-`ObsConfig.nnja_withhold_stations` (or `inference.py --withhold-stations`) drops every
-report of a fixed 10% of radiosonde, pibal and land stations (crc32 of the station id,
-`is_withheld` in `observations/loaders/nnja_conventional.py`). `score --stations withheld`
+`observations.is_withheld` picks a fixed 10% of radiosonde, pibal and land stations by the
+crc32 of the station id, the set a training run can withhold. `score --stations withheld`
 scores exactly those stations.
 
 ## Running
 
-Prerequisites:
-
-- `nnja-ai` (`uv sync --group private`) for `fetch`;
-- the pinned earth2studio checkout for regions (`bash private/scripts/campaign/bootstrap_e2s.sh`);
-- run on a compute node in the project container.
+Prerequisites: `nnja-ai` (`pip install nnja-ai`) for `fetch`; `h5py` for `h5:` systems.
+Run from `recipes/eval`.
 
 ```bash
-S=private.scripts.analysis.obs_scores
+S=src.obs_scoring.cli
 # radiosondes and surface stations
 python -m $S fetch --start 2025-07-08 --end 2025-08-05T18 --cache MIRROR
 python -m $S score --start 2025-07-08 --end 2025-08-05T18 --cache MIRROR --out OUT --pairs \
-    --system healda=zarr:ANALYSIS.zarr --system era5=era5 --system hres=zarr:ifs_hres_t0_025.zarr
+    --system mine=zarr:ANALYSIS.zarr --system era5=h5:ERA5_PACK_DIR
 python -m $S compare --out OUT --gross 5                  # add --region, --by-dataset, --fields, --match
-# VAD winds from the PrepBUFR archive (--archive defaults to the .env NNJA root)
-python -m $S score --obs vad --vertical height --start 2025-07-08 --end 2025-08-05T18 \
-    --out OUT_VAD --system healda=zarr:ANALYSIS.zarr --system era5=era5
+# VAD winds from the NNJA PrepBUFR parquet archive
+python -m $S score --obs vad --vertical height --archive ARCHIVE --start 2025-07-08 \
+    --end 2025-08-05T18 --out OUT_VAD --system mine=zarr:ANALYSIS.zarr --system era5=arco
 ```
 
 Cost: `fetch` ~15 MB per day of observations; `score` ~0.5 s per analysis time per system
-plus ~15 s per run (region table, ERA5 readers), parallel over `--workers` (default 16).
+from local stores plus ~15 s per run (region table), parallel over `--workers` (default 16).
+`arco` adds a remote read of every field per time.
 
+## Forecasts (`figures.py`)
+
+Online observation scoring (`scoring.online.observations` in a run config, `src/obs_online.py`)
+writes per-report pairs for every lead. `figures.py` pools them over inits for several IC
+sources of one model: `accumulate` aligns the reports every source has, applies the
+consensus gross check and the 2 m temperature variants, and writes error sums; `plot` draws
+tables, curves (with a day-block bootstrap) and 2 m temperature bias; `scorecards` writes
+RMSE by field, lead and day per source and region as netCDF. METHOD.md section 6.
 
 ## Validation
 

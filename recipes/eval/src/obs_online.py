@@ -14,19 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Online scoring against observations, by an external observation scorer.
+"""Online scoring against observations.
 
 At every lead step of an online run the forecast is scored against the
 observations valid at ``IC + lead``, without writing the forecast.  The
 observation methodology (reading, quality control, the time window, the
-interpolation to observation points and the per-region scores) is not
-implemented here: it is the ``private.obs_scoring`` package of a HealDA
-checkout (``scoring.online.observations.scorer_root``), whose
-``score.cycle_observations`` and ``score.score_cycle`` this module calls on
-the in-memory forecast.  That package and its dependencies run in spawned
-worker processes whose import path starts with ``scorer_root``, so they
-cannot clash with packages the forecast process imports, and their CPU work
-overlaps the next model step.
+interpolation to observation points and the per-region scores) is the
+``obs_scoring`` package beside this module, whose ``score.cycle_observations``
+and ``score.score_cycle`` this module calls on the in-memory forecast.  They
+run in spawned worker processes, so their CPU work overlaps the next model
+step.
 
 Per IC and rank, the scores (the scorer's per-cycle table plus ``init``,
 ``lead_time`` and, for ensembles, ``member``) and optionally the matched
@@ -43,8 +40,6 @@ it off::
     scoring:
       online:
         observations:
-          scorer_root: /path/to/healda          # provides private.obs_scoring
-          extra_paths: [/path/to/nnja-ai]       # prepended after scorer_root
           obs: conventional                     # or vad / aircraft
           cache: /path/to/nnja-ai-mirror        # obs=conventional
           archive: null                         # PrepBUFR archive, obs=vad/aircraft
@@ -63,7 +58,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from collections.abc import Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
@@ -108,8 +102,6 @@ def scorer_name(variable: str) -> str | None:
 class ObservationSettings:
     """Parsed ``scoring.online.observations`` block (see the module docstring)."""
 
-    scorer_root: str
-    extra_paths: tuple[str, ...] = ()
     obs: str = "conventional"
     cache: str | None = None
     archive: str | None = None
@@ -149,8 +141,6 @@ def parse_observation_settings(cfg: DictConfig) -> ObservationSettings | None:
     if obs_cfg is None:
         return None
     opts = OmegaConf.to_container(obs_cfg, resolve=True)
-    if not opts.get("scorer_root"):
-        raise ValueError("scoring.online.observations.scorer_root is required.")
     known = set(ObservationSettings.__dataclass_fields__)
     unknown = set(opts) - known
     if unknown:
@@ -159,25 +149,9 @@ def parse_observation_settings(cfg: DictConfig) -> ObservationSettings | None:
         )
     if opts.get("system") is None:
         opts["system"] = str(cfg.get("run_id", "forecast"))
-    opts["extra_paths"] = tuple(opts.get("extra_paths") or ())
     settings = ObservationSettings(**opts)
     settings.source  # noqa: B018  (validates cache / archive up front)
     return settings
-
-
-STANDARD_REGIONS = Path(__file__).parents[1] / "scorecard/cfg/regions/standard.yaml"
-
-
-def standard_regions() -> dict:
-    """The scorecard's standard regions plus ``global``, the observation scorer's
-    ``standard_regions`` (it reads the same file through this recipe)."""
-    import yaml
-
-    from .regions import parse_regions
-
-    return parse_regions(
-        {"global": None, **yaml.safe_load(STANDARD_REGIONS.read_text())}
-    )
 
 
 def store_root(cfg: DictConfig, settings: ObservationSettings) -> Path:
@@ -236,24 +210,14 @@ _worker: dict[str, Any] = {}
 
 
 def _init_worker(settings: ObservationSettings) -> None:
-    root = Path(settings.scorer_root)
-    sys.path[:0] = [str(root), str(root / "src"), *settings.extra_paths]
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-    loaded = sys.modules.get("healda")
-    if loaded is not None and not str(getattr(loaded, "__file__", "")).startswith(
-        str(root)
-    ):
-        raise RuntimeError(
-            f"healda was imported from {loaded.__file__} before the observation "
-            f"scorer at {root}; the scorer needs its own checkout's package."
-        )
-    from private.obs_scoring import fields, score
+    from .obs_scoring import fields, score
 
     _worker.update(
         settings=settings,
         score=score,
         fields=fields,
-        regions=standard_regions(),
+        regions=score.standard_regions(),
         obs={},
         orography={},
     )
@@ -332,7 +296,7 @@ def _score_step(
 
 def _gather_store(settings: ObservationSettings, root: str) -> str:
     """Score tables under *root*/parts -> the scorer's store layout (worker side)."""
-    from private.obs_scoring import report
+    from .obs_scoring import report
 
     parts = sorted((Path(root) / "parts" / settings.system).glob("*.parquet"))
     if not parts:

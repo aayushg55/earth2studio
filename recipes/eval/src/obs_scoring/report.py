@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from private.obs_scoring import observations
-from private.obs_scoring.score import UNITS, field_units, score
+from . import observations
+from .score import UNITS, field_units, score
 
 PRESSURE_TICKS = (10, 50, 100, 150, 200, 250, 300, 400, 500, 700, 850, 925, 1000)
 StationMask = Callable[[pd.DataFrame], np.ndarray]

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Field sources for scoring: each turns a store into ``sample``'s input for one time.
 
-``open_fields("zarr:PATH" | "era5" | "wb2:PATH").at(time, names)`` returns an
+``open_fields("zarr:PATH" | "h5:ROOT[:ROOT...]" | "arco").at(time, names)`` returns an
 ``xr.Dataset`` with ``lat``/``lon`` coordinates and the requested variables the store has at
 that time, or None when the store has no such time.
 """
@@ -10,35 +10,38 @@ that time, or None when the store has no such time.
 from __future__ import annotations
 
 import functools
+import json
+import os
+
 import numpy as np
 import pandas as pd
 import xarray as xr
 
+from .thermo import GRAVITY
+
 LAT = np.linspace(90, -90, 721)
 LON = np.arange(1440) * 0.25
-# The variables the ERA5 source reads per time.
-ERA5_FIELDS = (
-    [
-        f"{v}{p}"
-        for v in "ZTUV"
-        for p in (10, 50, 100, 150, 200, 250, 300, 400, 500, 700, 850, 925, 1000)
-    ]
-    + [f"Q{p}" for p in (50, 100, 150, 200, 250, 300, 400, 500, 700, 850, 925, 1000)]
-    + ["Z600", "U600", "V600", "tas", "uas", "vas", "sp", "d2m"]
-)
+PRESSURE_LEVELS = (10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000)
+# Scorer field name to earth2studio variable name.
+E2S_NAMES = {
+    **{f"{v}{p}": f"{v.lower()}{p}" for v in "ZTUVQ" for p in PRESSURE_LEVELS},
+    "tas": "t2m",
+    "uas": "u10m",
+    "vas": "v10m",
+    "sp": "sp",
+    "d2m": "d2m",
+}
 
 
 @functools.cache
 def era5_orography() -> np.ndarray:
-    """ERA5 terrain height (m) on the 0.25 degree grid, lat 90 to -90."""
-    from healda.datasets import era5_statics
-    from healda.utils.cache import AtomicFileCache
-    from healda.utils.thermo import GRAVITY
+    """ERA5 terrain height (m) on the 0.25 degree grid, lat 90 to -90, from ARCO ERA5."""
+    from earth2studio.data import ARCO_ERA5
 
-    _, fname, var = era5_statics._ERA5_NC[0]
-    cache = AtomicFileCache(era5_statics.config.CACHE_DIR)
-    path = cache.ensure(f"{era5_statics.ERA5_INVARIANTS_URI}/{fname}", {"anon": True})
-    return era5_statics._load_nc(path, var) / np.float32(GRAVITY)
+    z = ARCO_ERA5(cache=True, verbose=False)(
+        time=[pd.Timestamp("2020-01-01")], variable=["z"]
+    )
+    return (np.asarray(z.values[0, 0]) / GRAVITY).astype(np.float32)
 
 
 def era5_orography_on(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
@@ -70,8 +73,8 @@ def _dataset(values: dict[str, np.ndarray], lat, lon, names) -> xr.Dataset:
 
 
 class ZarrFields:
-    """A lat-lon zarr store with one (time, lat, lon) array per field, named as in HealDA.
-    Times whose ``run_id`` is negative and fields whose ``is_valid`` is false are absent."""
+    """A lat-lon zarr store with one (time, lat, lon) array per field, named as the keys of
+    ``E2S_NAMES`` (``Z500``, ``tas``). Times whose ``run_id`` is negative and fields whose ``is_valid`` is false are absent."""
 
     def __init__(self, path: str):
         import zarr
@@ -113,62 +116,75 @@ class ZarrFields:
         return _dataset(values, self.lat, self.lon, names)
 
 
-class Era5Fields:
-    """ERA5 hourly packs."""
+class H5Fields:
+    """ERA5 HDF5 packs: per pack directory a ``YYYY.h5`` per year with a ``(time, channel,
+    lat, lon)`` dataset and a ``metadata/data.json`` sidecar naming its path (``h5_path``),
+    channels and time step (``dhours``). A field is read from the first pack, in the order
+    given, that has its channel at that time."""
 
-    def __init__(self):
-        from healda.datasets.da.hourly_latlon_dataset import (
-            HOURLY_PACK_NAME,
-            hourly_pack_roots,
-        )
-        from healda.datasets.era5_hourly_h5 import Era5HourlyH5
+    def __init__(self, roots: list[str]):
+        self.packs = []
+        for root in roots:
+            with open(os.path.join(root, "metadata", "data.json")) as f:
+                meta = json.load(f)
+            self.packs.append((root, meta, meta["coords"]["channel"]))
+        meta = self.packs[0][1]
+        self.lat, self.lon = meta["coords"]["lat"], meta["coords"]["lon"]
 
-        groups = {}
-        for name in ERA5_FIELDS:
-            pack = HOURLY_PACK_NAME[name]
-            groups.setdefault(tuple(hourly_pack_roots([pack])), {})[name] = pack
-        self.readers = [
-            (list(names), Era5HourlyH5(list(roots), list(names.values())))
-            for roots, names in groups.items()
-        ]
+    @functools.cache
+    def _file(self, path: str):
+        import h5py
+
+        return h5py.File(path, "r")
+
+    def _read(self, time: pd.Timestamp, channel: str) -> np.ndarray | None:
+        for root, meta, channels in self.packs:
+            path = os.path.join(root, f"{time.year}.h5")
+            if channel not in channels or not os.path.exists(path):
+                continue
+            offset = time - pd.Timestamp(year=time.year, month=1, day=1)
+            step, rest = divmod(offset, pd.Timedelta(hours=meta["dhours"]))
+            data = self._file(path)[meta["h5_path"]]
+            if rest == pd.Timedelta(0) and step < data.shape[0]:
+                return data[step, channels.index(channel)]
+        return None
 
     def at(self, time: pd.Timestamp, names: list[str]) -> xr.Dataset | None:
         values = {}
-        for pack_names, reader in self.readers:
-            try:
-                block = reader.read(pd.DatetimeIndex([time]))[0]
-            except (KeyError, IndexError, ValueError):
-                continue
-            values.update(zip(pack_names, block))
+        for name in names:
+            if name in E2S_NAMES:
+                value = self._read(time, E2S_NAMES[name])
+                if value is not None:
+                    values[name] = value
         if not values:
             return None
-        return _dataset({n: values[n] for n in names if n in values}, LAT, LON, names)
+        return _dataset(values, self.lat, self.lon, names)
 
 
-class Wb2Fields:
-    """A WeatherBench2-layout zarr (level dimension, CF names), via ``wb2_store``."""
+class DataSourceFields:
+    """Any earth2studio data source on the 0.25 degree lat-lon grid (ARCO ERA5 by default);
+    one request per time."""
 
-    def __init__(self, path: str):
-        from private.scripts.analysis.wb2_store import WB2Store
+    def __init__(self, source=None):
+        if source is None:
+            from earth2studio.data import ARCO_ERA5
 
-        self.store = WB2Store(path, profile=None)
-        self.index = {t: i for i, t in enumerate(self.store.times)}
+            source = ARCO_ERA5(cache=False, verbose=False)
+        self.source = source
 
     def at(self, time: pd.Timestamp, names: list[str]) -> xr.Dataset | None:
-        if time not in self.index:
-            return None
-        i = self.index[time]
-        return _dataset(
-            {n: self.store[n][i] for n in names if n in self.store}, LAT, LON, names
-        )
+        wanted = [n for n in names if n in E2S_NAMES]
+        data = self.source(time=[time], variable=[E2S_NAMES[n] for n in wanted])
+        values = {n: np.asarray(data.values[0, i]) for i, n in enumerate(wanted)}
+        return _dataset(values, data["lat"].values, data["lon"].values, names)
 
 
 def open_fields(spec: str):
     kind, _, rest = spec.partition(":")
-    if kind == "era5":
-        return Era5Fields()
-    if kind == "wb2":
-        return Wb2Fields(rest)
+    if kind == "arco":
+        return DataSourceFields()
+    if kind == "h5":
+        return H5Fields(rest.split(":"))
     if kind == "zarr":
         return ZarrFields(rest)
     raise ValueError(f"unknown system kind {kind!r} in {spec!r}")
