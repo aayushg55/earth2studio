@@ -78,6 +78,7 @@ import os
 import re
 import shutil
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -177,6 +178,13 @@ class OnlineSettings:
         the verification grid.  Required for ACC; ``None`` disables it.
     verification_cache_size : int
         Number of verification valid times held per rank.
+    verification_shard : bool
+        Each rank of an ensemble group reads an equal share of the
+        variables and the group all-gathers the full field, instead of
+        every rank reading every variable.
+    verification_prefetch : bool
+        Read the next lead step's verification field on a background
+        thread while the model runs the current step.
     validate_coords : bool
         Whether to cross-check each step's lead time across the group.  A
         pipeline whose ``run_item`` yields different coords for different
@@ -255,6 +263,8 @@ class OnlineSettings:
     moment_comm_dtype: torch.dtype
     climatology: Any
     verification_cache_size: int
+    verification_shard: bool
+    verification_prefetch: bool
     validate_coords: bool
     nccl_timeout_s: int
     crps: bool
@@ -437,6 +447,8 @@ def parse_online_settings(cfg: DictConfig) -> OnlineSettings:
         moment_comm_dtype=moment_dtype,
         climatology=block.get("climatology", None),
         verification_cache_size=int(block.get("verification_cache_size", 4)),
+        verification_shard=bool(block.get("verification_shard", True)),
+        verification_prefetch=bool(block.get("verification_prefetch", True)),
         validate_coords=bool(block.get("validate_coords", True)),
         nccl_timeout_s=int(block.get("nccl_timeout_s", 1800)),
         crps=bool(block.get("crps", True)),
@@ -704,6 +716,8 @@ class FieldCache:
         max_size: int = 4,
         nan_policy: str = "propagate",
         valid_ranges: dict | None = None,
+        comm: GroupComm | None = None,
+        prefetch: bool = False,
     ) -> None:
         self._source = source
         self._variables = list(variables)
@@ -714,6 +728,22 @@ class FieldCache:
         self._valid_ranges = valid_ranges or {}
         self._cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self._coords: CoordSystem = OrderedDict({"variable": np.array(self._variables)})
+        # With a group communicator, this rank reads only its share of the
+        # variables; the shares are padded to one size for the all-gather.
+        self._comm = comm if comm is not None and comm.group.group_size > 1 else None
+        if self._comm is None:
+            self._share = self._variables
+            self._share_size = len(self._variables)
+        else:
+            shares = np.array_split(
+                np.arange(len(self._variables)), self._comm.group.group_size
+            )
+            self._share = [
+                self._variables[i] for i in shares[self._comm.group.group_rank]
+            ]
+            self._share_size = max(len(s) for s in shares)
+        self._pool = ThreadPoolExecutor(1) if prefetch else None
+        self._pending: dict[int, Future] = {}
 
     def get(self, valid_time: np.datetime64) -> torch.Tensor:
         """Return the field at *valid_time* as a ``[variable, <spatial...>]`` tensor.
@@ -734,19 +764,60 @@ class FieldCache:
             self._cache.move_to_end(key)
             return cached
 
-        field = self._fetch(valid_time)
+        field = self._fetch(key, valid_time)
         self._cache[key] = field
         self._cache.move_to_end(key)
         while len(self._cache) > self._max_size:
             self._cache.popitem(last=False)
         return field
 
-    def _fetch(self, valid_time: np.datetime64) -> torch.Tensor:
-        da = self._source([valid_time], list(self._variables))
+    def prefetch(self, valid_time: np.datetime64) -> None:
+        """Start reading this rank's share of *valid_time* in the background.
+
+        Local to the rank: the group all-gather happens in :meth:`get`, so
+        every rank still issues its collectives in the same order.
+        """
+        if self._pool is None:
+            return
+        key = int(np.datetime64(valid_time, "ns").astype("int64"))
+        if key in self._cache or key in self._pending:
+            return
+        self._pending[key] = self._pool.submit(self._read_share, valid_time)
+
+    def _read_share(self, valid_time: np.datetime64) -> torch.Tensor:
+        da = self._source([valid_time], list(self._share))
         da = da.transpose("time", "variable", *self._spatial_dims)
-        tensor = torch.from_numpy(np.asarray(da.values[0]).copy()).to(
-            device=self._device, dtype=torch.float32
-        )
+        values = torch.from_numpy(np.ascontiguousarray(da.values[0], dtype=np.float32))
+        if values.shape[0] < self._share_size:
+            pad = torch.zeros(
+                (self._share_size - values.shape[0], *values.shape[1:]),
+                dtype=values.dtype,
+            )
+            values = torch.cat([values, pad])
+        return values.pin_memory() if self._device.type == "cuda" else values
+
+    def _fetch(self, key: int, valid_time: np.datetime64) -> torch.Tensor:
+        pending = self._pending.pop(key, None)
+        share = pending.result() if pending is not None else self._read_share(valid_time)
+        # Futures for times that were skipped are dropped with their reads.
+        self._pending = {k: f for k, f in self._pending.items() if k > key}
+        share = share.to(device=self._device, non_blocking=True)
+        if self._comm is None:
+            tensor = share
+        else:
+            buffers, _ = self._comm.all_gather(share)
+            tensor = torch.cat(
+                [
+                    b[: len(part)]
+                    for b, part in zip(
+                        buffers,
+                        np.array_split(
+                            np.arange(len(self._variables)),
+                            self._comm.group.group_size,
+                        ),
+                    )
+                ]
+            )
 
         if self._nan_policy == "zero_fill":
             tensor = torch.nan_to_num(tensor, nan=0.0)
@@ -2555,6 +2626,10 @@ class OnlineScorer:
 
         valid_time = np.datetime64(self._item.time, "ns") + lead
         y = self._verification.get(valid_time)
+        if lead_index + 1 < len(self._lead_times):
+            self._verification.prefetch(
+                np.datetime64(self._item.time, "ns") + self._lead_times[lead_index + 1]
+            )
         clim = self._climatology.get(valid_time) if self._climatology else None
 
         if f_local.shape[1:] != y.shape:
@@ -3074,6 +3149,8 @@ def build_online_scorer(
         max_size=settings.verification_cache_size,
         nan_policy=nan_policy,
         valid_ranges=valid_ranges,
+        comm=comm if settings.verification_shard else None,
+        prefetch=settings.verification_prefetch,
     )
 
     climatology = None

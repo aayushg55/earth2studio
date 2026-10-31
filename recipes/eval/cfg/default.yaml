@@ -242,6 +242,8 @@ scoring:
         # other knob.  float32 halves the moment reduction's wire volume.
         moment_comm_dtype: float64
         verification_cache_size: 4     # valid times held per rank
+        verification_shard: true       # each group rank reads a share of the variables
+        verification_prefetch: true    # read the next lead while the model steps
         validate_coords: true          # cross-check lead steps within a group
         nccl_timeout_s: 1800           # a dead rank hangs its whole group
         # DataSource supplying climatology on the verification grid; required
