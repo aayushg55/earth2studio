@@ -211,6 +211,12 @@ class OnlineSettings:
         least one must exist.
     lsd_wavenumber_cutoff : int | None
         Optional radial-mode cutoff forwarded to the earth2studio metric.
+    crps_kernel : str
+        ``"sorted"`` computes the pairwise CRPS term from the members sorted
+        at each gridpoint, ``sum_k (2k - M - 1) x_(k)``, on float32
+        residuals; each rank of the group evaluates its share of the
+        variable chunks.  ``"pairwise"`` sums ``|x_i - x_j|`` over every
+        pair on the ``pairwise_comm_dtype`` wire.
     pairwise_comm_dtype : torch.dtype
         Wire dtype for the member exchange.  ``bfloat16`` halves the volume;
         the arithmetic upcasts to float64 immediately on arrival.  Safe
@@ -271,6 +277,7 @@ class OnlineSettings:
     mae: bool
     lsd: bool
     lsd_wavenumber_cutoff: int | None
+    crps_kernel: str
     pairwise_comm_dtype: torch.dtype
     defer_pairwise_one_step: bool
     variable_chunk: int
@@ -452,6 +459,7 @@ def parse_online_settings(cfg: DictConfig) -> OnlineSettings:
         validate_coords=bool(block.get("validate_coords", True)),
         nccl_timeout_s=int(block.get("nccl_timeout_s", 1800)),
         crps=bool(block.get("crps", True)),
+        crps_kernel=_crps_kernel(block.get("crps_kernel", "sorted")),
         pairwise_comm_dtype=pairwise_dtype,
         defer_pairwise_one_step=defer,
         variable_chunk=variable_chunk,
@@ -472,6 +480,15 @@ def _int_or(value: Any, default: int) -> int:
     as if it had never been written.
     """
     return default if value is None else int(value)
+
+
+def _crps_kernel(value: Any) -> str:
+    kernel = str(value).lower()
+    if kernel not in ("sorted", "pairwise"):
+        raise ValueError(
+            f"scoring.online.crps_kernel must be 'sorted' or 'pairwise', got {value!r}."
+        )
+    return kernel
 
 
 def _parse_dtype(value: Any, allowed: dict[str, torch.dtype], key: str) -> torch.dtype:
@@ -1693,6 +1710,49 @@ def _abs_diff_weighted_sum(
     return out
 
 
+def _sorted_pair_sum(
+    members: torch.Tensor,
+    weights: torch.Tensor,
+    n_spatial: int,
+    w_flat: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``sum_{i<j} sum_s w_s |f_i(s) - f_j(s)|`` from the sorted members.
+
+    For values sorted ascending, ``sum_{i<j} |x_i - x_j| = sum_k (2k - M - 1)
+    x_(k)``, so one sort and one weighted sum over members replace the
+    ``M (M - 1) / 2`` pairs.  The per-gridpoint term is float32; the spatial
+    sum is float64.
+
+    Parameters
+    ----------
+    members : torch.Tensor
+        Every member of the ensemble, ``[M, variable, <spatial...>]``.
+    weights : torch.Tensor
+        Spatial weights broadcastable over the spatial dims.
+    n_spatial : int
+        Number of trailing spatial dimensions.
+    w_flat : torch.Tensor | None
+        Regional weights ``[n_spatial_points, region]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Float64 ``[variable]`` tensor (``[variable, region]`` regional).
+    """
+    m = members.shape[0]
+    ordered = torch.sort(members.float(), dim=0).values
+    # The coefficients sum to zero, so offsetting by the smallest member leaves
+    # the sum unchanged and makes identical members contribute exactly zero.
+    ordered = ordered - ordered[:1]
+    coef = torch.arange(1, m + 1, device=members.device, dtype=torch.float32)
+    coef = (2 * coef - m - 1).view(m, *([1] * (members.ndim - 1)))
+    per_point = (coef * ordered).sum(dim=0).double()
+    if w_flat is not None:
+        return per_point.reshape(per_point.shape[0], -1) @ w_flat
+    axes = tuple(range(per_point.ndim - n_spatial, per_point.ndim))
+    return (per_point * weights).sum(dim=axes)
+
+
 @dataclass
 class _PendingExchange:
     """An in-flight (or ready) member exchange for one lead step."""
@@ -1803,7 +1863,8 @@ class PairwiseExchange:
                 "PairwiseExchange: a previous exchange is still pending — two "
                 "lead steps were submitted without an intervening completion."
             )
-        dtype = self._settings.pairwise_comm_dtype
+        sorted_kernel = self._settings.crps_kernel == "sorted"
+        dtype = torch.float32 if sorted_kernel else self._settings.pairwise_comm_dtype
         # Masked once for the whole exchange, before chunking or the wire
         # cast: a gridpoint invalid for its variable (StepContext.valid)
         # must compare as identical "absent" state across every member,
@@ -1842,25 +1903,36 @@ class PairwiseExchange:
         if ctx.w_flat is not None:
             out_shape = (len(self._var_index), ctx.n_regions)
         total = torch.zeros(out_shape, dtype=torch.float64, device=ctx.d_local.device)
+        sorted_kernel = self._settings.crps_kernel == "sorted"
+        group = ctx.comm.group
         offset = 0
-        for local, buffers, handle in zip(
-            pending.local_chunks, pending.gathered, pending.work
+        for c, (local, buffers, handle) in enumerate(
+            zip(pending.local_chunks, pending.gathered, pending.work)
         ):
             if handle is not None:
                 handle.wait()
-            members = torch.cat(buffers, dim=0)
             width = local.shape[1]
-            total[offset : offset + width] = _abs_diff_weighted_sum(
-                local,
-                members,
-                ctx.weights,
-                ctx.n_spatial,
-                member_tile=self._settings.pairwise_member_tile,
-                w_flat=ctx.w_flat,
-            )
+            if sorted_kernel:
+                # Each chunk is evaluated by one rank of the group; the
+                # reduce below sums the disjoint shares.
+                if c % group.group_size == group.group_rank:
+                    total[offset : offset + width] = _sorted_pair_sum(
+                        torch.cat(buffers, dim=0),
+                        ctx.weights,
+                        ctx.n_spatial,
+                        w_flat=ctx.w_flat,
+                    )
+            else:
+                total[offset : offset + width] = 0.5 * _abs_diff_weighted_sum(
+                    local,
+                    torch.cat(buffers, dim=0),
+                    ctx.weights,
+                    ctx.n_spatial,
+                    member_tile=self._settings.pairwise_member_tile,
+                    w_flat=ctx.w_flat,
+                )
             offset += width
 
-        total *= 0.5
         ctx.comm.reduce(total)
         return pending.lead_index, total
 
