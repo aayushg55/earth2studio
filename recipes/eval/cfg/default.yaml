@@ -123,6 +123,9 @@ output:
         - t2m
         - z500
     overwrite: true
+    # Rewrite the per-IC stats store as one chunk per array once every IC is scored.
+    # False leaves it per-IC for a separate job to compact.
+    compact_stats: true
     thread_writers: 4   # 0 = synchronous writes
     # time/lead_time/ensemble must keep chunk size 1 with async_zarr: they are
     # written one slice per step, and a larger chunk would let concurrent writes

@@ -238,7 +238,8 @@ def _run_online(
                 torch.distributed.barrier()
             if dist.rank == 0:
                 finalize_stats(cfg)
-                compact_stats_store(cfg)
+                if cfg.output.get("compact_stats", True):
+                    compact_stats_store(cfg)
                 finalize_observation_scores(cfg)
             return
     else:
@@ -394,7 +395,9 @@ def _run_online(
         finalize_observation_scores(cfg)
         # A multi-job campaign shares these stores, so this job finishing its
         # own slice does not mean the campaign is done; re-check all_times.
-        if not filter_online_completed(list(all_times), cfg):
+        if cfg.output.get("compact_stats", True) and not filter_online_completed(
+            list(all_times), cfg
+        ):
             for ref_name in verif_sources:
                 compact_stats_store(
                     cfg,
