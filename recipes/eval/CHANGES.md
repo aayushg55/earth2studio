@@ -15,26 +15,23 @@ the forecast is written.
   run, and finalizes the observation store after `finalize_stats`, including on a resumed run
   with nothing left to do.
 - `test/test_obs_online.py`: name mapping, config parsing, and sampling plus scoring on a
-  synthetic linear field, then the store layout. The scorer tests need
-  `OBS_SCORER_ROOT=<checkout with private/obs_scoring>` and skip without it.
+  synthetic linear field, then the store layout.
 
-## The observation methodology is external
+## The observation methodology is in `src/obs_scoring`
 
-The recipe does not read, quality-control or interpolate observations itself. A HealDA
-checkout's `private.obs_scoring` does all of it, named by `scorer_root`:
-- `cycle.cycle_observations`: the NNJA-AI mirror or the PrepBUFR archive, QC, the ±30 min window
+The recipe reads, quality-controls and interpolates observations with `src/obs_scoring`, a copy
+of HealDA's `private/obs_scoring` (its `README.md` lists the differences):
+- `score.cycle_observations`: the NNJA-AI mirror or the PrepBUFR archive, QC, the ±30 min window
   and the station selection.
-- `cycle.score_cycle`: `sample` (bilinear, periodic in longitude; `Z/g`; wind speed from the
+- `score.score_cycle`: `sample` (bilinear, periodic in longitude; `Z/g`; wind speed from the
   interpolated u and v; `q2m` from `d2m` and `sp`) and `score` (RMSE, MAE, bias and count per
   region and field).
 
-The functions are called on the in-memory forecast. They run in spawned worker processes whose
-import path starts at `scorer_root`, so the scorer's own `healda` package cannot clash with
-packages the forecast process imports. The CPU work also overlaps the next model step.
+The functions are called on the in-memory forecast in spawned worker processes, so the CPU work
+overlaps the next model step.
 
 - **Regions**: the scorecard's `scorecard/cfg/regions/standard.yaml` plus `global`, parsed by
-  `src.regions.parse_regions`. This is the file and parser the scorer's `standard_regions`
-  uses through its own copy of this recipe.
+  `src.regions.parse_regions`.
 - **Name mapping**: earth2studio names map to the scorer's (`t2m`→`tas`, `u10m`→`uas`,
   `v10m`→`vas`, `msl`→`pres_msl`, `z500`→`Z500`, ...). Only output variables with a mapping
   are handed over.
@@ -60,8 +57,6 @@ packages the forecast process imports. The CPU work also overlaps the next model
 scoring:
   online:
     observations:
-      scorer_root: /path/to/healda   # provides private.obs_scoring
-      extra_paths: []                # prepended after scorer_root in the workers
       obs: conventional              # or vad / aircraft
       cache: /path/to/mirror         # NNJA-AI mirror (obs_scores fetch), obs=conventional
       archive: null                  # PrepBUFR archive, obs=vad/aircraft

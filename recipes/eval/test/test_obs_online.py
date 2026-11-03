@@ -14,17 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for online observation scoring (src/obs_online.py).
-
-The sampling and scoring tests run the external observation scorer in
-process; they need a checkout providing ``private.obs_scoring``, named by
-``OBS_SCORER_ROOT``, and are skipped without one.
-"""
+"""Tests for online observation scoring (src/obs_online.py)."""
 
 from __future__ import annotations
-
-import os
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -38,11 +30,6 @@ from src.obs_online import (
     scorer_name,
 )
 
-SCORER_ROOT = os.environ.get("OBS_SCORER_ROOT")
-needs_scorer = pytest.mark.skipif(
-    not SCORER_ROOT or not Path(SCORER_ROOT, "private/obs_scoring").is_dir(),
-    reason="OBS_SCORER_ROOT does not name a checkout with private/obs_scoring",
-)
 GRAVITY = 9.80665
 
 
@@ -58,9 +45,7 @@ def test_settings_default_off_and_validated():
     cfg = OmegaConf.create(
         {
             "run_id": "arm",
-            "scoring": {
-                "online": {"observations": {"scorer_root": "/x", "cache": "/m"}}
-            },
+            "scoring": {"online": {"observations": {"cache": "/m"}}},
         }
     )
     assert parse_observation_settings(cfg).system == "arm"
@@ -104,13 +89,10 @@ def synthetic_step(tmp_path):
             ),
         }
     )
-    settings = ObservationSettings(
-        scorer_root=SCORER_ROOT, cache=str(tmp_path), pairs=True, system="arm"
-    )
+    settings = ObservationSettings(cache=str(tmp_path), pairs=True, system="arm")
     return settings, names, values, lat, lon, valid, obs
 
 
-@needs_scorer
 def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     settings, names, values, lat, lon, valid, obs = synthetic_step(tmp_path)
     obs_online._init_worker(settings)
@@ -147,7 +129,6 @@ def test_sampling_and_scores_on_a_synthetic_field(tmp_path):
     assert ds.time.values[0, 0] == np.datetime64(valid)
 
 
-@needs_scorer
 def test_elevation_correction_moves_tas_to_the_station(tmp_path):
     import dataclasses
 
@@ -183,9 +164,7 @@ def test_resume_reruns_ics_without_observation_scores_and_overwrite_clears(tmp_p
         {
             "run_id": "arm",
             "output": {"path": str(tmp_path)},
-            "scoring": {
-                "online": {"observations": {"scorer_root": "/x", "cache": "/m"}}
-            },
+            "scoring": {"online": {"observations": {"cache": "/m"}}},
         }
     )
     settings = parse_observation_settings(cfg)
