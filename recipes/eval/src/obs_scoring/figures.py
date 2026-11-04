@@ -96,8 +96,8 @@ def display_unit(u: str) -> tuple[float, str]:
 
 
 def ic_style(cfg: Path, name: str) -> dict:
-    p = cfg / "ic_sources" / f"{name}.yaml"
-    return yaml.safe_load(p.read_text()) if p.is_file() else {}
+    found = sorted((cfg / "ic_sources").rglob(f"{name}.yaml"))
+    return yaml.safe_load(found[0].read_text()) if found else {}
 
 
 def run_experiment(exp: dict, experiment: str, ic: str, model: str) -> str:
@@ -1248,7 +1248,7 @@ def write_markdown(e, table, path):
 def mode_plot(e, a):
     table = curves_table(e)
     e.out.mkdir(parents=True, exist_ok=True)
-    table.to_csv(e.out / f"tables{e.suffix}.csv", index=False, float_format="%.4f")
+    table.to_csv(e.out / f"tables{e.suffix}.csv", index=False, float_format="%.6g")
     write_markdown(e, table, e.out / f"tables{e.suffix}.md")
     inits = e.inits_label()
     head = f"{e.model} forecasts from {e.systems_label()} vs observations at valid time"
