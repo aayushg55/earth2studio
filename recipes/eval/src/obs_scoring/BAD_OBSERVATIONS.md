@@ -404,7 +404,7 @@ valid timestamp" [N1]. In the 555,482 radiosonde rows of the mirror:
 
 ## 6. Scripts and outputs
 
-`report.py` is `private/obs_scoring/report.py`. The other scripts are one-off scratch scripts and
+`report.py` is `private/eval/obs/scoring/report.py`. The other scripts are one-off scratch scripts and
 are not committed; their outputs were written to a local working directory.
 
 | script | does | outputs |

@@ -1,6 +1,6 @@
 # Observation scorer and figures in the recipe (branch ag-e2s-obs-scoring-refresh)
 
-- `src/obs_scoring/`: HealDA's observation scorer (`private/obs_scoring`), with the figures
+- `src/obs_scoring/`: HealDA's observation scorer (`private/eval/obs/scoring`), with the figures
   and paired init bootstrap of its `obs_figures.py` (`accumulate`, `plot`) as
   `src/obs_scoring/figures.py`. `src/obs_scoring/README.md` lists every difference from
   HealDA's copy.
@@ -32,7 +32,7 @@ the forecast is written.
 ## The observation methodology is in `src/obs_scoring`
 
 The recipe reads, quality-controls and interpolates observations with `src/obs_scoring`, a copy
-of HealDA's `private/obs_scoring` (its `README.md` lists the differences):
+of HealDA's `private/eval/obs/scoring` (its `README.md` lists the differences):
 - `score.cycle_observations`: the NNJA-AI mirror or the PrepBUFR archive, QC, the ±30 min window
   and the station selection.
 - `score.score_cycle`: `sample` (bilinear, periodic in longitude; `Z/g`; wind speed from the

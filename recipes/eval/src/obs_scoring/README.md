@@ -1,7 +1,8 @@
 # Observation-space scoring (`src/obs_scoring`)
 
-This package is HealDA's `private/obs_scoring` and the `accumulate` and `plot` modes of
-`private/scripts/campaign/obs_figures.py` (HealDA 410200be): the scorer that `src/obs_online.py`
+This package is HealDA's `private/eval/obs/scoring` and the `accumulate` and `plot` modes of
+`private/eval/campaign/obs_figures.py` (first copied at HealDA 410200be, when they were
+`private/obs_scoring` and `private/scripts/campaign/obs_figures.py`): the scorer that `src/obs_online.py`
 calls at every lead step, and the figures and paired bootstrap over inits drawn from the pairs
 it writes (`figures.py`, `python -m src.obs_scoring.figures`). The copy differs from HealDA's
 only where HealDA imports its own package or configuration:
@@ -72,7 +73,7 @@ variables named like the HealDA channels (`Z500`, `T850`, `tas`, `d2m`, ...; `Z`
 geopotential). Any source that produces this can be scored; a HEALPix store after
 regridding to lat-lon (earth2grid), for example.
 
-## Command line (`private/scripts/analysis/obs_scores.py`)
+## Command line (`private/eval/obs/obs_scores.py`)
 
 For each 6-hourly analysis time t:
 
@@ -134,7 +135,9 @@ They follow NOAA PSL eagle-tools `obs-metrics`:
   positions exist in PrepBUFR (`XDR`, `YDR`, `HRDR`): copied from the measured drift for
   stations that report in BUFR, and estimated from the reported winds with a 5 m/s ascent
   rate for stations that report only in the text format. See `private/docs/radiosonde_drift.md`;
-- surface stations with no elevation correction (see `--elevation-correct` below);
+- surface stations with no elevation correction (see `--elevation-correct` below); the
+  figures' default protocol `wmo` moves 2 m temperature and `sp` to the station elevation
+  (`METHOD.md` §6, "Protocols");
 - a value is dropped when its quality mark is > 2, and a missing mark is kept;
 - dewpoint becomes specific humidity with the Magnus formula (`healda.utils.thermo`).
 
@@ -216,7 +219,7 @@ scores exactly those stations.
 Prerequisites:
 
 - `nnja-ai` (`uv sync --group private`) for `fetch`;
-- the pinned earth2studio checkout for regions (`bash private/scripts/campaign/bootstrap_e2s.sh`);
+- the pinned earth2studio checkout for regions (`bash private/eval/campaign/bootstrap_e2s.sh`);
 - run on a compute node in the project container.
 
 ```bash

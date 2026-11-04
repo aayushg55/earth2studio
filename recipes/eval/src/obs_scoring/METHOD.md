@@ -1,10 +1,10 @@
 # Observation verification: every step, filter and correction
 
 What happens to an observation between the NNJA-AI [1] file and a number in a figure, and why. It
-covers analyses (`private/scripts/analysis/obs_scores.py`) and forecasts (online scoring in the
-earth2studio eval recipe, figures by `private/scripts/campaign/obs_figures.py`). Module-level
+covers analyses (`private/eval/obs/obs_scores.py`) and forecasts (online scoring in the
+earth2studio eval recipe, figures by `private/eval/campaign/obs_figures.py`). Module-level
 detail and the command lines are in `README.md` beside this file; the campaign side is in
-`private/scripts/campaign/README.md`, "Observation-verified runs".
+`private/eval/campaign/README.md`, "Observation-verified runs".
 
 The scorer's defaults follow NOAA PSL eagle-tools `obs-metrics` [2], so default scores can be
 compared with it. Every step that departs from eagle-tools is optional and named in the output
