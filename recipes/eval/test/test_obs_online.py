@@ -49,6 +49,10 @@ def test_settings_default_off_and_validated():
         }
     )
     assert parse_observation_settings(cfg).system == "arm"
+    cfg.scoring.online.observations.elevation_correct = True
+    with pytest.raises(ValueError, match="needs orography"):
+        parse_observation_settings(cfg)
+    del cfg.scoring.online.observations.elevation_correct
     cfg.scoring.online.observations.typo = 1
     with pytest.raises(ValueError, match="typo"):
         parse_observation_settings(cfg)
@@ -135,6 +139,14 @@ def test_elevation_correction_moves_tas_to_the_station(tmp_path):
     import xarray as xr
 
     settings, names, values, lat, lon, valid, obs = synthetic_step(tmp_path)
+    grid_lat, grid_lon = np.linspace(90, -90, 721), np.arange(1440) * 0.25
+    height = 1000 * np.cos(np.deg2rad(grid_lat))[:, None] + 0 * grid_lon
+    orography = tmp_path / "orography.nc"
+    xr.Dataset(
+        {"Z": (("time", "latitude", "longitude"), GRAVITY * height[None])},
+        coords={"latitude": grid_lat, "longitude": grid_lon},
+    ).to_netcdf(orography)
+    settings = dataclasses.replace(settings, orography=str(orography))
     init = np.datetime64("2026-07-15T06", "ns")
     lead = np.timedelta64(6, "h").astype("timedelta64[ns]")
     model = {}
@@ -147,14 +159,7 @@ def test_elevation_correction_moves_tas_to_the_station(tmp_path):
         model[correct] = pairs[pairs.field == "tas"].model.to_numpy()
 
     tas = obs[obs.field == "tas"]
-    terrain = (
-        xr.DataArray(
-            obs_online._worker["fields"].era5_orography(),
-            coords={"lat": np.linspace(90, -90, 721), "lon": np.arange(1440) * 0.25},
-        )
-        .interp(lat=xr.DataArray(tas.lat.values), lon=xr.DataArray(tas.lon.values))
-        .values
-    )
+    terrain = 1000 * np.cos(np.deg2rad(tas.lat.values))
     # Stations at 0 m: the model's 2 m temperature warms by the lapse rate over its terrain.
     np.testing.assert_allclose(model[True] - model[False], 0.0065 * terrain, atol=0.3)
 

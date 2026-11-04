@@ -1,3 +1,15 @@
+# Observation scorer and figures in the recipe (branch ag-e2s-obs-scoring-refresh)
+
+- `src/obs_scoring/`: HealDA's observation scorer (`private/obs_scoring`), with the figures
+  and paired init bootstrap of its `obs_figures.py` (`accumulate`, `plot`) as
+  `src/obs_scoring/figures.py`. `src/obs_scoring/README.md` lists every difference from
+  HealDA's copy.
+- `scoring.online.observations` no longer takes `scorer_root` or `extra_paths`; the workers
+  import `src.obs_scoring`. It takes `orography`, the local ERA5 invariant surface
+  geopotential file, required with `elevation_correct` (runs have no network).
+- The older copy in commits 4d855e2 / 0df78be (day-block bootstrap, t-tests) is superseded;
+  nothing imports it.
+
 # Online scoring against observations (branch ag-e2s-obs-online)
 
 ## What it adds
@@ -63,6 +75,8 @@ scoring:
       stations: all                  # all | withheld | kept
       by_dataset: false
       dedupe_surface: false
+      elevation_correct: false       # tas / sp moved to the station elevation
+      orography: null                # ERA5 invariant z .nc; required with elevation_correct
       vertical: pressure
       pairs: false
       system: null                   # null -> run_id
@@ -79,7 +93,8 @@ observations need (`t2m u10m v10m d2m sp` and `z/t/u/v/q` on the model levels).
 - **Grid**: the forecast grid is the model's. For Aurora (720 rows, no 90° S row), reports
   south of 89.75° S get NaN: the South Pole station, 2 surface reports per cycle. Fields the
   model lacks (10 hPa radiosonde levels) also get NaN, as for any store without them.
-- **No `elevation_correct`**: it needs the model orography, which a forecast chunk does not carry.
+- **`elevation_correct`**: moves `tas` and `sp` from the ERA5 terrain (the `orography` file,
+  read locally; runs have no network) to each station's elevation.
 - **Validation** (Aurora 1.5, 2026-06-01 06 UTC, IC sampled at lead 0, against the CLI on the
   same analysis stores): the observation rows are identical and in the same order. Model values
   agree exactly (max |diff| 0) wherever both are finite. Counts and RMSE agree in every region

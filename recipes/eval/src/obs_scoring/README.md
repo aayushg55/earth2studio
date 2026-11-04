@@ -1,13 +1,29 @@
 # Observation-space scoring (`src/obs_scoring`)
 
-This package is HealDA's `private/obs_scoring` (as of a3b50f95), the scorer that
-`src/obs_online.py` calls at every lead step. The copy differs from HealDA's only where HealDA
-imports its own package: `thermo.py` is HealDA's `healda/utils/thermo.py`;
-`observations.is_withheld` is the training holdout of
-`healda/observations/loaders/nnja_conventional.py`; `fields.era5_orography` downloads the
-same ERA5 invariant file into the earth2studio cache; `fields` reads lat-lon zarr stores
-only. The command line for analysis stores (`obs_scores.py`) and the ERA5 HDF5 and
-WeatherBench2 readers stay in HealDA; paths below starting with `private/` are HealDA's.
+This package is HealDA's `private/obs_scoring` and the `accumulate` and `plot` modes of
+`private/scripts/campaign/obs_figures.py` (HealDA 410200be): the scorer that `src/obs_online.py`
+calls at every lead step, and the figures and paired bootstrap over inits drawn from the pairs
+it writes (`figures.py`, `python -m src.obs_scoring.figures`). The copy differs from HealDA's
+only where HealDA imports its own package or configuration:
+
+- `thermo.py` is HealDA's `healda/utils/thermo.py`;
+- `observations.is_withheld` is the training holdout of
+  `healda/observations/loaders/nnja_conventional.py`;
+- `fields.era5_orography` reads the ERA5 invariant surface geopotential file from a path the
+  caller gives (the online block's `orography`, `figures accumulate --orography`) instead of
+  HealDA's download cache; `fields` reads lat-lon zarr stores only;
+- `figures.py` reads the campaign configuration directory (`--campaign-cfg`, experiments and
+  IC source styles) and the runs directory (`--runs-root`) from arguments or
+  `E2S_CAMPAIGN_CFG` / `E2S_CAMPAIGN_RUNS_ROOT`, and the regions from
+  `obs_online.standard_regions`; HealDA's `scorecards` and `stations` modes and the paper
+  caption helpers are not copied.
+
+The command line for analysis stores (`obs_scores.py`) and the ERA5 HDF5 and WeatherBench2
+readers stay in HealDA; paths below starting with `private/` are HealDA's.
+
+Commits 4d855e2 and 0df78be (on top of 6453993, on no branch) hold an older copy of this
+package that predates the current protocol (day-block bootstrap and t-tests); this copy
+supersedes it and nothing imports it.
 
 Scores gridded fields against conventional observations: radiosondes, surface stations, NEXRAD
 VAD winds and aircraft winds. Any field can be scored; several systems scored on the same

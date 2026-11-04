@@ -47,6 +47,7 @@ it off::
           by_dataset: false
           dedupe_surface: false
           elevation_correct: false              # tas / sp to the station elevation
+          orography: null                       # ERA5 z invariant .nc, elevation_correct
           vertical: pressure                    # pressure | height
           pairs: false
           system: null                          # null -> run_id
@@ -109,6 +110,7 @@ class ObservationSettings:
     by_dataset: bool = False
     dedupe_surface: bool = False
     elevation_correct: bool = False
+    orography: str | None = None
     vertical: str = "pressure"
     pairs: bool = False
     system: str = "forecast"
@@ -151,6 +153,15 @@ def parse_observation_settings(cfg: DictConfig) -> ObservationSettings | None:
         opts["system"] = str(cfg.get("run_id", "forecast"))
     settings = ObservationSettings(**opts)
     settings.source  # noqa: B018  (validates cache / archive up front)
+    if settings.elevation_correct and not (
+        settings.orography and Path(settings.orography).is_file()
+    ):
+        raise ValueError(
+            "scoring.online.observations.elevation_correct needs orography: the path of "
+            "the ERA5 invariant surface geopotential file "
+            "(e5.oper.invariant.128_129_z.ll025sc.1979010100_1979010100.nc); "
+            f"got {settings.orography!r}."
+        )
     return settings
 
 
@@ -242,7 +253,9 @@ def _orography(lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
     key = (lat.size, float(lat[0]), lon.size, float(lon[0]))
     cache = _worker["orography"]
     if key not in cache:
-        cache[key] = _worker["fields"].era5_orography_on(lat, lon)
+        cache[key] = _worker["fields"].era5_orography_on(
+            lat, lon, _worker["settings"].orography
+        )
     return cache[key]
 
 
