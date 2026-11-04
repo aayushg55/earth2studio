@@ -96,8 +96,14 @@ def display_unit(u: str) -> tuple[float, str]:
 
 
 def ic_style(cfg: Path, name: str) -> dict:
-    found = sorted((cfg / "ic_sources").rglob(f"{name}.yaml"))
-    return yaml.safe_load(found[0].read_text()) if found else {}
+    """An IC source's fields from cfg/ic_sources/<model>.yaml: the file's shared keys and the
+    source's own entry under ``sources``."""
+    for path in sorted((cfg / "ic_sources").glob("*.yaml")):
+        model = yaml.safe_load(path.read_text())
+        if name in model.get("sources", {}):
+            shared = {k: v for k, v in model.items() if k not in ("sources", "datasource")}
+            return {**shared, **model["sources"][name]}
+    return {}
 
 
 def run_experiment(exp: dict, experiment: str, ic: str, model: str) -> str:
