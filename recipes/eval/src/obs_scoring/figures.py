@@ -101,7 +101,9 @@ def ic_style(cfg: Path, name: str) -> dict:
     for path in sorted((cfg / "ic_sources").glob("*.yaml")):
         model = yaml.safe_load(path.read_text())
         if name in model.get("sources", {}):
-            shared = {k: v for k, v in model.items() if k not in ("sources", "datasource")}
+            shared = {
+                k: v for k, v in model.items() if k not in ("sources", "datasource")
+            }
             return {**shared, **model["sources"][name]}
     return {}
 
