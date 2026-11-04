@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import dataclasses
 import functools
 import hashlib
@@ -71,6 +72,46 @@ from .score import point_regions
 from .thermo import pressure_at_height, temperature_at_height
 
 NBOOT = 1000
+
+
+def paired_bootstrap_interval(
+    a, b, weights=None, sqrt=False, n_resamples=NBOOT, seed=0
+):
+    """95 % percentile interval (lo, hi) of 100 (stat_a / stat_b - 1).
+
+    ``a`` and ``b`` hold one value per init along axis 0; trailing axes are cells, each
+    with its own interval. stat is the ``weights``-weighted mean over inits (weights are
+    report counts; the plain mean without them), square-rooted when ``sqrt``: for RMSE pass
+    per-init MSE, so stat = sqrt(sum sq / sum n). Each of the ``n_resamples`` replicates
+    draws the inits with replacement and applies the same draw to both systems. A cell
+    draws among the inits valid in it (finite values, positive weight); cells with fewer
+    than 2 get NaN. ``seed`` is an int or a numpy Generator; cells with the same valid
+    inits get the same draws.
+    """
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    w = np.ones_like(a) if weights is None else np.asarray(weights, dtype=float)
+    shape = a.shape[1:]
+    a, b, w = (x.reshape(len(x), -1) for x in (a, b, w))
+    valid = np.isfinite(a) & np.isfinite(b) & np.isfinite(w) & (w > 0)
+    sum_a = np.where(valid, a * w, 0.0)
+    sum_b = np.where(valid, b * w, 0.0)
+    rng = np.random.default_rng(seed)
+    lo = np.full(a.shape[1], np.nan)
+    hi = np.full(a.shape[1], np.nan)
+    masks, column_mask = np.unique(valid, axis=1, return_inverse=True)
+    for k, mask in enumerate(masks.T):
+        inits = np.flatnonzero(mask)
+        if len(inits) < 2:
+            continue
+        cells = column_mask.ravel() == k
+        pick = inits[rng.integers(0, len(inits), (n_resamples, len(inits)))]
+        draws = np.zeros((n_resamples, len(a)))
+        np.add.at(draws, (np.arange(n_resamples)[:, None], pick), 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = (draws @ sum_a[:, cells]) / (draws @ sum_b[:, cells])
+        pct = 100 * ((np.sqrt(ratio) if sqrt else ratio) - 1)
+        lo[cells], hi[cells] = np.percentile(pct, [2.5, 97.5], axis=0)
+    return lo.reshape(shape), hi.reshape(shape)
 PAIRS_GLOB = "obs_scores/pairs/all/*/*.parquet"
 RUN_NAME = "{experiment}__{model}__{ic}__{sample}"
 NICE = {
@@ -615,6 +656,22 @@ def reference_rules(items, fields, terrain, all_checks):
     return rules, distinct
 
 
+@dataclasses.dataclass
+class ReferenceChecks:
+    """What every init of an accumulate reads: the ERA5 terrain (m), the rejected report
+    keys of each reference check and, per reference, the sorted report keys of each of its
+    files (``reference_rules``)."""
+
+    terrain: np.ndarray | None = None
+    rules: dict = dataclasses.field(default_factory=dict)
+    covered: list = dataclasses.field(default_factory=list)
+
+
+# Set by accumulate before its worker processes fork, so the workers share it instead of
+# receiving a copy per init.
+CHECKS = ReferenceChecks()
+
+
 def contains(sorted_keys, keys):
     i = np.searchsorted(sorted_keys, keys).clip(max=max(len(sorted_keys) - 1, 0))
     return sorted_keys[i] == keys if len(sorted_keys) else np.zeros(len(keys), bool)
@@ -623,14 +680,9 @@ def contains(sorted_keys, keys):
 def covered(keys):
     """Whether every reference analysis has each report (in one of its files)."""
     found = np.ones(len(keys), bool)
-    for files in COVERED:
+    for files in CHECKS.covered:
         found &= np.any([contains(f, keys) for f in files], axis=0)
     return found
-
-
-# Per reference, the sorted report keys of each of its files; set by accumulate before its
-# worker processes fork, so the workers share them instead of receiving a copy per init.
-COVERED = []
 
 
 @functools.cache
@@ -723,10 +775,10 @@ def rejected_by(rules, keys):
     return rejected
 
 
-def init_reports(files, fields, terrain, rules):
+def init_reports(files, fields):
     """One init's per-report errors (system, report) and report table: the reports every
     IC source has a model value for, with ``change`` (station elevation minus terrain),
-    ``rejected`` (``rejected_by``), ``covered`` (in every reference analysis) and,
+    ``rejected`` (``rejected_by`` the ``CHECKS`` rules), ``covered`` (in every reference analysis) and,
     for sp, the same report's observed ``tas_obs`` and ``q2m_obs``."""
     tables = {}
     for s, paths in files.items():
@@ -754,7 +806,7 @@ def init_reports(files, fields, terrain, rules):
     errors = np.stack([(t["model"] - t["obs"])[keep] for t in tables.values()])
     names = ("code", "lead", "strict", "lat", "lon", "elevation", "obs")
     reports = {k: first[k][keep] for k in names}
-    reports["rejected"] = rejected_by(rules, first["key"][keep])
+    reports["rejected"] = rejected_by(CHECKS.rules, first["key"][keep])
     reports["covered"] = covered(first["key"][keep])
     for name in ("tas", "q2m"):
         reports[f"{name}_obs"] = station_values(
@@ -765,7 +817,7 @@ def init_reports(files, fields, terrain, rules):
     reports["init"] = np.full(len(errors[0]), first["init"][0].astype("datetime64[ns]"))
     reports["group"] = reports["lead"].astype(np.int64) * len(fields) + reports["code"]
     reports["change"] = station_height_change(
-        terrain,
+        CHECKS.terrain,
         era5_grid.LAT,
         era5_grid.LON,
         *(reports[k] for k in ("lat", "lon", "elevation")),
@@ -802,11 +854,11 @@ def elevation_variants(errors, reports, fields):
         yield variant, moved, selected
 
 
-def init_sums(files, fields, terrain, rules, all_checks):
+def init_sums(files, all_checks):
     """One init's error sums from each IC source's pairs files of that init, and per field
-    the reports kept by the first reference check and how many of them no reference has.
-    """
-    init, max_lead, errors, reports = init_reports(files, fields, terrain, rules)
+    the reports kept by the first reference check and how many of them no reference has."""
+    fields, rules = FIELDS, CHECKS.rules
+    init, max_lead, errors, reports = init_reports(files, fields)
     systems = list(files)
     sonde = np.isin(reports["code"], [fields.index(f) for f in UPPER])
     if not reports["strict"][~sonde].all():
@@ -893,7 +945,7 @@ def check_sums_schema(path):
 
 
 def mode_accumulate(e, a):
-    global COVERED
+    global CHECKS
     started = time.monotonic()
     e.sums.mkdir(parents=True, exist_ok=True)
     by_init = {s: files_by_init(e.files[s]) for s in e.systems}
@@ -903,7 +955,9 @@ def mode_accumulate(e, a):
     references = a.reference_pairs or [
         f"{r}={','.join(map(str, period_files(e.runs, r)))}" for r in REFERENCES
     ]
-    rules, COVERED = reference_rules(references, FIELDS, terrain, a.all_checks)
+    CHECKS = ReferenceChecks(
+        terrain, *reference_rules(references, FIELDS, terrain, a.all_checks)
+    )
     print(
         f"reference checks ready after {time.monotonic() - started:.0f} s", flush=True
     )
@@ -911,14 +965,7 @@ def mode_accumulate(e, a):
     fork = multiprocessing.get_context("fork")
     with concurrent.futures.ProcessPoolExecutor(a.workers, mp_context=fork) as pool:
         jobs = [
-            pool.submit(
-                init_sums,
-                {s: by_init[s][i] for s in e.systems},
-                FIELDS,
-                terrain,
-                rules,
-                a.all_checks,
-            )
+            pool.submit(init_sums, {s: by_init[s][i] for s in e.systems}, a.all_checks)
             for i in common
         ]
         for done, job in enumerate(concurrent.futures.as_completed(jobs), 1):
@@ -1011,6 +1058,18 @@ def combine(table, name, systems):
     return table[table.field == name]
 
 
+def pct_intervals(sq, n, pairs, rng):
+    """``paired_bootstrap_interval`` of % RMSE change of each (system, baseline) in ``pairs``
+    over inits, from per-init squared-error sums ``sq[system]`` and report counts ``n``."""
+    if not pairs:
+        return [], []
+    mse = {s: sq[s] / n for s in sq}
+    a = np.stack([mse[s] for s, _ in pairs], axis=1)
+    b = np.stack([mse[base] for _, base in pairs], axis=1)
+    weights = np.repeat(n[:, None], len(pairs), axis=1)
+    return paired_bootstrap_interval(a, b, weights, sqrt=True, seed=rng)
+
+
 def curve(e, inits, rng):
     """RMSE, bias and % RMSE differences per lead, with 95 % paired bootstrap intervals
     over inits (the same resampled inits for every system)."""
@@ -1025,17 +1084,16 @@ def curve(e, inits, rng):
         for s in e.systems:
             row[f"rmse_{s}"] = np.sqrt(sq[s].sum() / n.sum())
             row[f"bias_{s}"] = g[f"e_{s}"].sum() / n.sum()
+        # The % intervals resample the same inits as the RMSE bands.
+        same_draws = copy.deepcopy(rng)
         pick = rng.integers(0, len(g), (NBOOT, len(g)))
-        boot = {s: np.sqrt(sq[s][pick].sum(1) / n[pick].sum(1)) for s in e.systems}
         for s in e.systems:
-            row[f"rmse_{s}_lo"], row[f"rmse_{s}_hi"] = np.percentile(
-                boot[s], [2.5, 97.5]
-            )
-        for s, b, key in comparisons:
+            boot = np.sqrt(sq[s][pick].sum(1) / n[pick].sum(1))
+            row[f"rmse_{s}_lo"], row[f"rmse_{s}_hi"] = np.percentile(boot, [2.5, 97.5])
+        lo, hi = pct_intervals(sq, n, [(s, b) for s, b, _ in comparisons], same_draws)
+        for (s, b, key), low, high in zip(comparisons, lo, hi):
             row[key] = 100 * (row[f"rmse_{s}"] / row[f"rmse_{b}"] - 1)
-            row[f"{key}_lo"], row[f"{key}_hi"] = np.percentile(
-                100 * (boot[s] / boot[b] - 1), [2.5, 97.5]
-            )
+            row[f"{key}_lo"], row[f"{key}_hi"] = low, high
         rows.append(row)
     return pd.DataFrame(rows)
 
