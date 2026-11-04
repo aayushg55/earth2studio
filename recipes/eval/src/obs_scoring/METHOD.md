@@ -1,12 +1,12 @@
 # Observation verification: every step, filter and correction
 
-What happens to an observation between the NNJA-AI file and a number in a figure, and why. It
+What happens to an observation between the NNJA-AI [1] file and a number in a figure, and why. It
 covers analyses (`private/scripts/analysis/obs_scores.py`) and forecasts (online scoring in the
 earth2studio eval recipe, figures by `private/scripts/campaign/obs_figures.py`). Module-level
 detail and the command lines are in `README.md` beside this file; the campaign side is in
 `private/scripts/campaign/README.md`, "Observation-verified runs".
 
-The scorer's defaults follow NOAA PSL eagle-tools `obs-metrics`, so default scores can be
+The scorer's defaults follow NOAA PSL eagle-tools `obs-metrics` [2], so default scores can be
 compared with it. Every step that departs from eagle-tools is optional and named in the output
 (`match`, `qc`, `elevation` columns), and every variant is computed side by side. The figures
 draw one of three protocols, `wmo` (default), `ecmwf` and `eagle` (section 6).
@@ -30,7 +30,7 @@ network: `fetch --config <campaign config>` fetches the days a run scores, and
 
 | filter | rule | why |
 | --- | --- | --- |
-| quality mark | a value whose quality mark is > 2 is dropped; a missing mark is kept | the NCEP marks: 0-2 accepted, 3+ suspect, rejected or not used. As eagle-tools. In NNJA-AI v1 the marks are dump marks and are only ever missing or 14 (SDM purge), so this drops the purges only (section 7.3) |
+| quality mark | a value whose quality mark is > 2 is dropped; a missing mark is kept | the NCEP PrepBUFR marks [4]: 0-2 keep, good or neutral, 3 suspect, 4-15 rejected. As eagle-tools. In NNJA-AI v1 the marks are dump marks and are only ever missing or 14 (SDM purge), so this drops the purges only (section 7.3) |
 | mandatory levels | radiosonde values only at the levels above; no significant levels | as eagle-tools; one value per level and station |
 | missing values | non-finite values are dropped | |
 | station pressure 0 | `sp` <= 0 Pa is missing (BUFR SYNOP carries 0 with no quality mark) | sentinel, not a pressure |
@@ -45,7 +45,7 @@ Nothing else is screened on read: no range check, no background check, no duplic
 
 | quantity | conversion | why |
 | --- | --- | --- |
-| radiosonde height | `GP10` / 9.8 (not 9.80665) | NCEP encodes reported gpm × 9.8; checked three ways (`README.md`, Validation) |
+| radiosonde height | `GP10` / 9.8 (not 9.80665); the model's geopotential / 9.80665 (`sample.py`) | NCEP encodes reported gpm × 9.8; checked three ways (`README.md`, Validation) |
 | winds | speed and direction to `u = -s sin(d)`, `v = -s cos(d)`; speed kept as `S{p}` / `sfcwind` | |
 | humidity | dewpoint to specific humidity with the Magnus formula at the level pressure (radiosondes) or the reported station pressure (surface); no `q2m` without a station pressure | `healda.utils.thermo.specific_humidity_from_dewpoint` |
 | longitude | to [0, 360) | |
@@ -59,7 +59,7 @@ from t - 90 min and scored in two selections side by side (`match`):
 | `match` | radiosondes | why |
 | --- | --- | --- |
 | `strict` | [t - 30 min, t + 30 min) | as eagle-tools (protocol `eagle`) |
-| `synoptic` (protocols `wmo`, `ecmwf`) | [t - 90 min, t + 30 min) | soundings stamped 23:00 of the day before miss the strict window (below); at 2025-07-01 00 UTC that is 140 stations |
+| `synoptic` (protocols `wmo`, `ecmwf`) | [t - 90 min, t + 30 min) | our choice: soundings stamped 23:00 of the day before miss the strict window (below); at 2025-07-01 00 UTC that is 140 stations |
 
 The radiosonde stamp (`OBS_TIMESTAMP`, which NNJA-AI describes only as "Observation timestamp")
 is always a whole hour and equals `MSG_DATE`. In 2024-12-30..2026-09-26 (555,482 rows):
@@ -144,9 +144,13 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
 ### Steps, per init
 
 1. **Common inits**: only inits every IC source completed.
-2. **Same reports**: the IC sources' pairs for an init must hold the same reports in the same
-   order (observed value, position, field, lead, times); `accumulate` stops otherwise. A report
-   is dropped when any IC source has no finite model value there.
+2. **Same reports**: every IC source is scored on the reports all of them hold. A report is
+   matched on lead, station, field, observation time and observed value (repeats pair up in
+   order of appearance). Pairs written from different observation caches (e.g. the 2026
+   r14, ERA5 and IFS runs against the Muon runs, which hold more radiosonde reports) differ;
+   `accumulate` then prints the reports left out per IC source and field and writes them to
+   `sums/dropped.csv`. A report is dropped when any IC source has no finite model value
+   there.
 3. **Station-elevation variants** (column `elevation`, `tas` and `sp`; every other field has
    `none`). With change = station elevation - ERA5 terrain at the station (0.25° orography,
    bilinear; `sample.station_height_change`):
@@ -184,9 +188,9 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
      (numbers above); dropping reports more than 15 K from ERA5 at the station height (removes
      0.06-0.2 % of the reports, 96-100 % of which the consensus check also removes; the check
      removes 0.3-0.8 %).
-   - Practice elsewhere: ECMWF verifies 2 m temperature with a 6.5 K/km correction, against only
-     the SYNOP stations within 250 m of the model height, rejecting observations more than 15 K
-     from the analysis (ECMWF Newsletter 178, 2024); its 4D-Var uses 5.5 K/km and stations from
+   - Source: ECMWF verifies 2 m temperature against only the SYNOP stations within 250 m of
+     the model height, rejecting observations more than 15 K from the analysis; 6.5 K/km is
+     the lapse rate "often used, including in verification" [5]. Its 4D-Var uses 5.5 K/km and stations from
      400 m below to 200 m above the model, and drops departures > 7.5 K from the background.
      `lapse6.5_win250` approximates the verification (all station types, the ERA5 terrain
      instead of each model's, the consensus check instead of the 15 K screen).
@@ -203,6 +207,7 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
    |c - median(c)| > 5 × 1.4826 × median(|c - median(c)|). Computed separately for each `match`
    and 2 m temperature variant. `obs_scores.py compare --gross` uses the same rule per field
    and cycle.
+   - Our choice (no external standard); evidence below.
    - Why: NNJA-AI passes reports that are grossly wrong for every model (section 7). In 2025
      they dominate the radiosonde RMSE: global Z250 RMSE is ~75-90 m at every lead without the
      check and rises from 14 to 41 m with it (WN2), and the upper-air curves alternate by lead
@@ -234,8 +239,9 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
    last), or `accumulate --reference-pairs NAME=FILE[,FILE] ...`. A report is rejected
    when |observation - reference analysis| exceeds a fixed limit for its field; the same
    reports are removed at every lead and for every IC source. `wmo_intersection` rejects only
-   what every reference rejects, `wmo_union` what any rejects. `--protocol wmo --reference
-   RULE` draws one (`RULE`: a reference name, `union` or `intersection`; default
+   what every reference rejects, `wmo_union` what any rejects; the intersection rule is our
+   choice, evidence in "Protocols" above (one reference alone moves % differences by at most
+   0.6 percentage points). `--protocol wmo --reference RULE` draws one (`RULE`: a reference name, `union` or `intersection`; default
    `intersection`).
    - Each reference file's rejected and present report keys are saved next to the period
      (`_observation_scores/<period>/reference_{flags,reports}_<name>.parquet`) and reused
@@ -264,10 +270,10 @@ mandatory levels, no vertical interpolation or balloon drift, and Magnus humidit
      | Q (g/kg), ours | 12 | 11 | 9.9 | 7.2 | 3.1 | 1.5 | 0.56 | 0.32 | 0.19 | 0.070 | 0.030 | 0.053 |
 
      Surface: `sp` 15 hPa (WMO), `tas` 15 K (ECMWF's 2 m temperature screen, ECMWF Newsletter
-     178; not a WMO land-surface limit; tested on the departure at the model terrain, while
-     the scored `tas` is moved to the station elevation), `uas`/`vas` vector and `sfcwind`
-     30 m/s and `q2m` 6.3 g/kg (ours).
-   - Sources of the WMO limits, WMO-No. 485 (2023 edition, Manual on the WMO Integrated
+     178 [5]; not a WMO land-surface limit; tested on the departure at the model terrain,
+     while the scored `tas` is moved to the station elevation), `uas`/`vas` vector and
+     `sfcwind` 30 m/s and `q2m` 6.3 g/kg (ours).
+   - Sources of the WMO limits, WMO-No. 485 [3] (2023 edition, Manual on the WMO Integrated
      Processing and Prediction System), Appendix 2.1.2 (exchange of monitoring results;
      gross-error limits on observed minus first-guess): section 2.1.1 heights, 2.1.2
      temperature (15 K below 700 hPa and at 50 hPa and above, 10 K between), 2.1.3 wind;
@@ -356,7 +362,10 @@ Then `plot` and `scorecards`:
   2-5 days (Geer 2016, Tellus A 68, 30229); for `fc5d_obs_2025` (256 inits drawn over the
   year) a moving-block bootstrap with 5- and 7-day blocks changed the median r14-vs-v2
   interval width, against a bootstrap over init days, by under 4 % and no significance
-  verdict.
+  verdict. For HealDA v2 Muon 1.0M against 720k (2025 and May-September 2026, 243 cells
+  each) 7-day blocks widened the intervals by a median of 3-4 % (10-90 %: 0.85-1.29x); the
+  lag-1 autocorrelation of the daily paired difference is 0.02-0.05. Between systems whose
+  differences persist with the weather regime, check again.
 - The % panels are against the reference IC source (the first scoring reference).
 
 ### Consistency of the inputs (2025-26 Aurora 1.5 10-day experiments)
@@ -493,3 +502,38 @@ no background check against the forecasting system's own background (the `wmo` r
 uses analyses). Station counts differ by valid hour and
 day, and every RMSE pools all reports of its lead, so a region dominated by dense networks
 (Europe, North America) weighs heavily in the global surface numbers.
+
+Ensemble scores against observations (spread, CRPS) are not computed: the online observation
+path scores each member on its own. CRPS against observations also needs the observation
+error accounted for, e.g. by perturbing each member with noise of the observation-error
+distribution before scoring (the perturbed-ensemble approach [6, 7]); without it a reliable
+ensemble looks under-dispersive. Every run with `pairs: true` already holds what an offline
+version needs: one row per observation, lead and member, all members matched to the same
+observations (about 2M rows and 28 MB per init for the 5-day deterministic Aurora run).
+
+## References
+
+1. NNJA-AI: AI-ready observations from the NOAA-NASA Joint Archive (Brightband), documentation
+   https://nnja-ai.readthedocs.io. The observations (section 1).
+2. NOAA PSL eagle-tools, `src/eagle/tools/obs_metrics.py`,
+   https://github.com/NOAA-PSL/eagle-tools/blob/main/src/eagle/tools/obs_metrics.py: ±30 min
+   window, quality marks > 2 dropped and missing kept (sections 2 and 4, protocol `eagle`).
+3. WMO, 2023 (updated 2024): Manual on the WMO Integrated Processing and Prediction System,
+   WMO-No. 485, https://library.wmo.int/idurl/4/35703. Gross-error limits, Appendix 2.1.2
+   (section 6, step 5).
+4. NCEP/EMC: PREPBUFR Table 7, quality markers,
+   https://www.emc.ncep.noaa.gov/mmb/data_processing/prepbufr.doc/table_7.htm (section 2).
+5. Ingleby, B., et al., 2024: Improved two-metre temperature forecasts in the 2024 upgrade.
+   ECMWF Newsletter 178,
+   https://www.ecmwf.int/en/newsletter/178/earth-system-science/improved-two-metre-temperature-forecasts-2024-upgrade
+   (section 6, steps 3 and 5).
+6. Saetra, Ø., H. Hersbach, J.-R. Bidlot and D. S. Richardson, 2004: Effects of observation
+   errors on the statistics for ensemble spread and reliability. Mon. Wea. Rev., 132,
+   1487-1501, https://doi.org/10.1175/1520-0493(2004)132<1487:EOOEOT>2.0.CO;2 (section 8).
+7. Ben Bouallègue, Z., T. Haiden, N. J. Weber, T. M. Hamill and D. S. Richardson, 2020:
+   Accounting for representativeness in the verification of ensemble precipitation
+   forecasts. Mon. Wea. Rev., 148, 2049-2062, https://doi.org/10.1175/MWR-D-19-0323.1
+   (section 8).
+
+Further literature on quality control and verification practice: `BAD_OBSERVATIONS.md`,
+References.

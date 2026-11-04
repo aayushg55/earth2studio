@@ -112,6 +112,8 @@ def paired_bootstrap_interval(
         pct = 100 * ((np.sqrt(ratio) if sqrt else ratio) - 1)
         lo[cells], hi[cells] = np.percentile(pct, [2.5, 97.5], axis=0)
     return lo.reshape(shape), hi.reshape(shape)
+
+
 PAIRS_GLOB = "obs_scores/pairs/all/*/*.parquet"
 RUN_NAME = "{experiment}__{model}__{ic}__{sample}"
 NICE = {
@@ -691,14 +693,58 @@ def figure_regions():
     return {name: standard[key] for name, key in REGIONS.items()}
 
 
-def aligned(tables, order_keys):
-    """The systems' tables sorted stably by order_keys, checked to hold the same reports."""
-    out = {}
+def occurrence_ids(keys):
+    """``keys`` with repeats told apart: the n-th row holding a key gets (key, n) hashed."""
+    order = np.argsort(keys, kind="stable")
+    ordered = keys[order]
+    starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])
+    runs = np.diff(np.r_[starts, len(keys)])
+    rank = np.empty(len(keys), np.int64)
+    rank[order] = np.arange(len(keys)) - np.repeat(starts, runs)
+    return hash_columns(keys, rank)
+
+
+def same_reports(tables, columns):
+    (_, first), *rest = tables.items()
+    return all(
+        len(t[c]) == len(first[c]) and pd.Series(t[c]).equals(pd.Series(first[c]))
+        for _, t in rest
+        for c in columns
+    )
+
+
+def aligned(tables, order_keys, report_keys):
+    """The systems' tables sorted stably by order_keys, restricted to the reports every
+    system holds, in the first system's order; and per system the field codes of the
+    reports it dropped. A report is matched on order_keys and ``report_keys`` ({system: a
+    function giving one key per row, in the tables' order}); repeats of a key pair up in
+    order of appearance. Tables that already hold the same reports come back sorted and
+    unchanged, with nothing dropped."""
+    out, ids = {}, {}
     for s, t in tables.items():
         order = np.lexsort([t[k] for k in reversed(order_keys)])
         out[s] = {k: v[order] for k, v in t.items()}
-    check_same_reports(out, ("obs", "lat", "lon", "code"), " after sorting")
-    return out
+        ids[s] = (order, report_keys[s])
+    columns = ("obs", "lat", "lon", "code")
+    if same_reports(out, columns):
+        return out, {}
+    for s, (order, keys) in ids.items():
+        ids[s] = occurrence_ids(
+            hash_columns(*(out[s][k] for k in order_keys), keys()[order])
+        )
+    shared = functools.reduce(np.intersect1d, ids.values())
+    first = next(iter(out))
+    wanted = ids[first][contains(shared, ids[first])]
+    dropped = {}
+    for s, t in out.items():
+        sorter = np.argsort(ids[s])
+        rows = sorter[np.searchsorted(ids[s], wanted, sorter=sorter)]
+        left = np.ones(len(ids[s]), bool)
+        left[rows] = False
+        dropped[s] = t["code"][left]
+        out[s] = {k: v[rows] for k, v in t.items()}
+    check_same_reports(out, columns, " after matching")
+    return out, dropped
 
 
 def field_codes(table, fields):
@@ -775,12 +821,36 @@ def rejected_by(rules, keys):
     return rejected
 
 
+def dropped_reports(systems, dropped, shared_code, fields):
+    """Per system and field, the reports left out because not every system holds them
+    (``dropped``: {system: field codes}, from ``aligned``) and the reports all share."""
+    shared = np.bincount(shared_code[shared_code >= 0], minlength=len(fields))
+    no_codes = np.zeros(0, np.int64)
+    frames = []
+    for s in systems:
+        code = dropped.get(s, no_codes)
+        counts = np.bincount(code[code >= 0], minlength=len(fields))
+        present = np.flatnonzero(counts + shared)
+        frames.append(
+            pd.DataFrame(
+                {
+                    "system": s,
+                    "field": np.asarray(fields, dtype=object)[present],
+                    "dropped": counts[present],
+                    "shared": shared[present],
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
 def init_reports(files, fields):
     """One init's per-report errors (system, report) and report table: the reports every
     IC source has a model value for, with ``change`` (station elevation minus terrain),
     ``rejected`` (``rejected_by`` the ``CHECKS`` rules), ``covered`` (in every reference analysis) and,
-    for sp, the same report's observed ``tas_obs`` and ``q2m_obs``."""
-    tables = {}
+    for sp, the same report's observed ``tas_obs`` and ``q2m_obs``; and
+    ``dropped_reports``."""
+    tables, keys = {}, {}
     for s, paths in files.items():
         t = pq.read_table(
             paths,
@@ -798,8 +868,14 @@ def init_reports(files, fields):
             tables[s]["time"] = (
                 t["time"].cast(pa.timestamp("ns")).to_numpy().view(np.int64)
             )
-    tables = aligned(tables, ["lead"])
+            keys[s] = functools.partial(np.copy, tables[s]["key"])
+        else:
+            keys[s] = functools.partial(
+                report_keys, t.select(["station", "field", "time", "obs"])
+            )
+    tables, dropped = aligned(tables, ["lead"], keys)
     first = next(iter(tables.values()))
+    dropped = dropped_reports(list(files), dropped, first["code"], fields)
     keep = (first["code"] >= 0) & np.all(
         [np.isfinite(t["model"]) for t in tables.values()], axis=0
     )
@@ -822,7 +898,7 @@ def init_reports(files, fields):
         era5_grid.LON,
         *(reports[k] for k in ("lat", "lon", "elevation")),
     )
-    return first["init"][0], int(first["lead"].max()), errors, reports
+    return first["init"][0], int(first["lead"].max()), errors, reports, dropped
 
 
 def elevation_variants(errors, reports, fields):
@@ -856,9 +932,10 @@ def elevation_variants(errors, reports, fields):
 
 def init_sums(files, all_checks):
     """One init's error sums from each IC source's pairs files of that init, and per field
-    the reports kept by the first reference check and how many of them no reference has."""
+    the reports kept by the first reference check and how many of them no reference has,
+    and ``dropped_reports``."""
     fields, rules = FIELDS, CHECKS.rules
-    init, max_lead, errors, reports = init_reports(files, fields)
+    init, max_lead, errors, reports, dropped = init_reports(files, fields)
     systems = list(files)
     sonde = np.isin(reports["code"], [fields.index(f) for f in UPPER])
     if not reports["strict"][~sonde].all():
@@ -902,7 +979,7 @@ def init_sums(files, all_checks):
             )
             tables.append(table.assign(elevation=variant))
     table = pd.concat(tables, ignore_index=True)
-    return init, max_lead, table.fillna({"elevation": "none"}), coverage
+    return init, max_lead, table.fillna({"elevation": "none"}), coverage, dropped
 
 
 def files_by_init(files):
@@ -944,6 +1021,25 @@ def check_sums_schema(path):
         raise SystemExit(f"{path} predates the elevation column; rerun accumulate")
 
 
+def report_dropped(dropped, path):
+    """Print and save the reports per system and field left out because not every system
+    holds them; removes a stale file when none were."""
+    table = dropped.groupby(["system", "field"])[["dropped", "shared"]].sum()
+    if not table.dropped.any():
+        path.unlink(missing_ok=True)
+        print("every system holds the same reports", flush=True)
+        return
+    table = table[table.dropped > 0]
+    table["share"] = table.dropped / (table.dropped + table.shared)
+    table.reset_index().to_csv(path, index=False)
+    print(
+        "reports left out, not held by every system (scored on the reports all share):",
+        flush=True,
+    )
+    print(table.to_string(), flush=True)
+    print(path, flush=True)
+
+
 def mode_accumulate(e, a):
     global CHECKS
     started = time.monotonic()
@@ -961,7 +1057,7 @@ def mode_accumulate(e, a):
     print(
         f"reference checks ready after {time.monotonic() - started:.0f} s", flush=True
     )
-    parts, coverage, inits, max_lead = [], [], [], 0
+    parts, coverage, dropped, inits, max_lead = [], [], [], [], 0
     fork = multiprocessing.get_context("fork")
     with concurrent.futures.ProcessPoolExecutor(a.workers, mp_context=fork) as pool:
         jobs = [
@@ -969,13 +1065,15 @@ def mode_accumulate(e, a):
             for i in common
         ]
         for done, job in enumerate(concurrent.futures.as_completed(jobs), 1):
-            init, lead, part, covered = job.result()
+            init, lead, part, covered, left_out = job.result()
             inits.append(pd.Timestamp(init))
             max_lead = max(max_lead, lead)
             parts.append(part)
             coverage.append(covered)
+            dropped.append(left_out)
             if done % 32 == 0 or done == len(jobs):
                 print(f"{done}/{len(jobs)} inits", flush=True)
+    report_dropped(pd.concat(dropped), e.sums / "dropped.csv")
     coverage = pd.concat(coverage).groupby("field")[["kept", "unchecked"]].sum()
     coverage["share"] = coverage.unchecked / coverage.kept
     print("kept reports without a pair in every reference analysis:", flush=True)
@@ -1060,7 +1158,8 @@ def combine(table, name, systems):
 
 def pct_intervals(sq, n, pairs, rng):
     """``paired_bootstrap_interval`` of % RMSE change of each (system, baseline) in ``pairs``
-    over inits, from per-init squared-error sums ``sq[system]`` and report counts ``n``."""
+    over inits, from per-init squared-error sums ``sq[system]`` and report counts ``n``.
+    """
     if not pairs:
         return [], []
     mse = {s: sq[s] / n for s in sq}
